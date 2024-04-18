@@ -10,9 +10,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/AlCutter/betty/log"
-	"github.com/AlCutter/betty/storage/posix"
-	f_log "github.com/transparency-dev/formats/log"
+	"github.com/AlCutter/betty/storage/gcs"
 	"golang.org/x/mod/sumdb/note"
 	"k8s.io/klog/v2"
 )
@@ -21,9 +19,11 @@ var (
 	leavesPerSecond = flag.Int64("leaves_per_second", 10, "How many leaves to generate per second")
 	leafSize        = flag.Int("leaf_size", 1024, "Leaf size in bytes")
 	numWriters      = flag.Int("num_writers", 100, "Number of parallel writers")
-	path            = flag.String("path", "/tmp/log", "Path to log root diretory")
 	batchSize       = flag.Int("batch_size", 1, "Size of batch before flushing")
 	batchMaxAge     = flag.Duration("batch_max_age", 100*time.Millisecond, "Max age for batch entries before flushing")
+
+	project = flag.String("project", os.Getenv("GOOGLE_CLOUD_PROJECT"), "GCP Project, take from env if unset")
+	bucket  = flag.String("bucket", "", "Bucket to use for storing log")
 
 	listen = flag.String("listen", ":2024", "Address:port to listen on")
 
@@ -38,6 +38,7 @@ type Storage interface {
 	// that index once it's durably committed.
 	// Implementations are expected to integrate these new entries in a "timely" fashion.
 	Sequence(context.Context, []byte) (uint64, error)
+	CurrentTree(context.Context) (uint64, []byte, error)
 }
 
 type latency struct {
@@ -87,21 +88,22 @@ func main() {
 	flag.Parse()
 	ctx := context.Background()
 
+	opts := gcs.StorageOpts{
+		ProjectID:       *project,
+		Bucket:          *bucket,
+		EntryBundleSize: *batchSize,
+	}
 	sKey, vKey := keysFromFlag()
-	ct := currentTree(*path, vKey)
-	nt := newTree(*path, sKey)
+	var s Storage = gcs.New(ctx, opts, *batchMaxAge, vKey, sKey)
 
-	if err := os.MkdirAll(*path, 0o755); err != nil {
-		klog.Exitf("failed to make directory structure: %v", err)
-	}
-	if _, _, err := ct(); err != nil {
-		klog.Infof("ct: %v", err)
-		if err := nt(0, []byte("Empty")); err != nil {
-			klog.Exitf("Failed to initialise log: %v", err)
+	/*
+		if _, _, err := ct(); err != nil {
+			klog.Infof("ct: %v", err)
+			if err := nt(0, []byte("Empty")); err != nil {
+				klog.Exitf("Failed to initialise log: %v", err)
+			}
 		}
-	}
-
-	var s Storage = posix.New(*path, log.Params{EntryBundleSize: *batchSize}, *batchMaxAge, ct, nt)
+	*/
 	l := &latency{}
 
 	http.HandleFunc("POST /add", func(w http.ResponseWriter, r *http.Request) {
@@ -122,45 +124,18 @@ func main() {
 		}
 		w.Write([]byte(fmt.Sprintf("%d\n", idx)))
 	})
-	fs := http.FileServer(http.Dir(*path))
-	http.Handle("GET /", fs)
+	/*
+		fs := http.FileServer(http.Dir(*path))
+		http.Handle("GET /", fs)
+	*/
 
-	go printStats(ctx, ct, l)
+	go printStats(ctx, s.CurrentTree, l)
 	if err := http.ListenAndServe(*listen, http.DefaultServeMux); err != nil {
 		klog.Exitf("ListenAndServe: %v", err)
 	}
 }
 
-func currentTree(path string, verifier note.Verifier) posix.CurrentTreeFunc {
-	return func() (uint64, []byte, error) {
-		b, err := posix.ReadCheckpoint(path)
-		if err != nil {
-			return 0, nil, fmt.Errorf("ReadCheckpoint: %v", err)
-		}
-		cp, _, _, err := f_log.ParseCheckpoint(b, verifier.Name(), verifier)
-		if err != nil {
-			return 0, nil, err
-		}
-		return cp.Size, cp.Hash, nil
-	}
-}
-
-func newTree(path string, signer note.Signer) posix.NewTreeFunc {
-	return func(size uint64, hash []byte) error {
-		cp := &f_log.Checkpoint{
-			Origin: signer.Name(),
-			Size:   size,
-			Hash:   hash,
-		}
-		n, err := note.Sign(&note.Note{Text: string(cp.Marshal())}, signer)
-		if err != nil {
-			return err
-		}
-		return posix.WriteCheckpoint(path, n)
-	}
-}
-
-func printStats(ctx context.Context, s posix.CurrentTreeFunc, l *latency) {
+func printStats(ctx context.Context, s func(ctx context.Context) (uint64, []byte, error), l *latency) {
 	interval := time.Second
 	var lastSize uint64
 	for {
@@ -168,7 +143,7 @@ func printStats(ctx context.Context, s posix.CurrentTreeFunc, l *latency) {
 		case <-ctx.Done():
 			return
 		case <-time.After(interval):
-			size, _, err := s()
+			size, _, err := s(ctx)
 			if err != nil {
 				klog.Errorf("Failed to get checkpoint: %v", err)
 				continue

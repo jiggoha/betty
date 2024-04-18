@@ -17,25 +17,35 @@ package gcs
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"path/filepath"
-	"strconv"
+	"time"
 
+	"github.com/AlCutter/betty/log/writer"
+	"github.com/transparency-dev/merkle/rfc6962"
 	"github.com/transparency-dev/serverless-log/api"
 	"github.com/transparency-dev/serverless-log/api/layout"
-	"github.com/transparency-dev/serverless-log/pkg/log"
+	"golang.org/x/mod/sumdb/note"
 	"google.golang.org/api/googleapi"
 	"google.golang.org/api/iterator"
 	"k8s.io/klog/v2"
 
 	gcs "cloud.google.com/go/storage"
+	f_log "github.com/transparency-dev/formats/log"
 )
 
-// Client is a serverless storage implementation which uses a GCS bucket to store tree state.
+// NewTreeFunc is the signature of a function which receives information about newly integrated trees.
+type NewTreeFunc func(size uint64, root []byte) error
+
+// CurrentTree is the signature of a function which retrieves the current integrated tree size and root hash.
+type CurrentTreeFunc func() (uint64, []byte, error)
+
+// Storage is a serverless storage implementation which uses a GCS bucket to store tree state.
 // The naming of the objects of the GCS object is:
 //
 //	leaves/aa/bb/cc/ddeeff...
@@ -44,7 +54,7 @@ import (
 //	checkpoint
 //
 // The functions on this struct are not thread-safe.
-type Client struct {
+type Storage struct {
 	gcsClient *gcs.Client
 	projectID string
 	// bucket is the name of the bucket where tree data will be stored.
@@ -58,12 +68,21 @@ type Client struct {
 	// read. This is useful for read-modify-write operation of the checkpoint.
 	checkpointGen int64
 
+	pool *writer.Pool
+
 	checkpointCacheControl string
 	otherCacheControl      string
+
+	entryBundleSize int
+
+	cpV note.Verifier
+	cpS note.Signer
+
+	curSize uint64
 }
 
-// ClientOpts holds configuration options for the storage client.
-type ClientOpts struct {
+// StorageOpts holds configuration options for the storage client.
+type StorageOpts struct {
 	// ProjectID is the GCP project which hosts the storage bucket for the log.
 	ProjectID string
 	// Bucket is the name of the bucket to use for storing log state.
@@ -75,27 +94,34 @@ type ClientOpts struct {
 	// all non-checkpoint objects to be set to this value. If unset, the current GCP default
 	// will be used.
 	OtherCacheControl string
+	EntryBundleSize   int
 }
 
-// NewClient returns a Client which allows interaction with the log stored in
+// New returns a Client which allows interaction with the log stored in
 // the specified bucket on GCS.
-func NewClient(ctx context.Context, opts ClientOpts) (*Client, error) {
+func New(ctx context.Context, opts StorageOpts, batchMaxAge time.Duration, cpV note.Verifier, cpS note.Signer) *Storage {
 	c, err := gcs.NewClient(ctx)
 	if err != nil {
-		return nil, err
+		klog.Exitf("Failed to create GCS storage: %v", err)
 	}
 
-	return &Client{
+	r := &Storage{
 		gcsClient:              c,
 		projectID:              opts.ProjectID,
 		bucket:                 opts.Bucket,
 		checkpointGen:          0,
 		checkpointCacheControl: opts.CheckpointCacheControl,
 		otherCacheControl:      opts.OtherCacheControl,
-	}, nil
+		entryBundleSize:        opts.EntryBundleSize,
+		cpV:                    cpV,
+		cpS:                    cpS,
+	}
+	r.pool = writer.NewPool(opts.EntryBundleSize, batchMaxAge, r.sequenceBatch)
+
+	return r
 }
 
-func (c *Client) bucketExists(ctx context.Context, bucket string) (bool, error) {
+func (c *Storage) bucketExists(ctx context.Context, bucket string) (bool, error) {
 	it := c.gcsClient.Buckets(ctx, c.projectID)
 	for {
 		bAttrs, err := it.Next()
@@ -113,9 +139,9 @@ func (c *Client) bucketExists(ctx context.Context, bucket string) (bool, error) 
 }
 
 // Create creates a new GCS bucket and returns an error on failure.
-func (c *Client) Create(ctx context.Context, bucket string) error {
+func (s *Storage) Create(ctx context.Context, bucket string) error {
 	// Check if the bucket already exists.
-	exists, err := c.bucketExists(ctx, bucket)
+	exists, err := s.bucketExists(ctx, bucket)
 	if err != nil {
 		return err
 	}
@@ -124,20 +150,20 @@ func (c *Client) Create(ctx context.Context, bucket string) error {
 	}
 
 	// Create the bucket.
-	bkt := c.gcsClient.Bucket(bucket)
-	if err := bkt.Create(ctx, c.projectID, nil); err != nil {
-		return fmt.Errorf("failed to create bucket %q in project %s: %w", bucket, c.projectID, err)
+	bkt := s.gcsClient.Bucket(bucket)
+	if err := bkt.Create(ctx, s.projectID, nil); err != nil {
+		return fmt.Errorf("failed to create bucket %q in project %s: %w", bucket, s.projectID, err)
 	}
 	bkt.ACL().Set(ctx, gcs.AllUsers, gcs.RoleReader)
 
-	c.bucket = bucket
-	c.nextSeq = 0
+	s.bucket = bucket
+	s.nextSeq = 0
 	return nil
 }
 
 // SetNextSeq sets the input as the nextSeq of the client.
-func (c *Client) SetNextSeq(num uint64) {
-	c.nextSeq = num
+func (s *Storage) SetNextSeq(num uint64) {
+	s.nextSeq = num
 }
 
 // WriteCheckpoint stores a raw log checkpoint on GCS if it matches the
@@ -147,20 +173,20 @@ func (c *Client) SetNextSeq(num uint64) {
 // This method will fail to write if 1) the checkpoint exists and the client
 // has never read it or 2) the checkpoint has been updated since the client
 // called ReadCheckpoint.
-func (c *Client) WriteCheckpoint(ctx context.Context, newCPRaw []byte) error {
-	bkt := c.gcsClient.Bucket(c.bucket)
+func (s *Storage) WriteCheckpoint(ctx context.Context, newCPRaw []byte) error {
+	bkt := s.gcsClient.Bucket(s.bucket)
 	obj := bkt.Object(layout.CheckpointPath)
 
 	var cond gcs.Conditions
-	if c.checkpointGen == 0 {
+	if s.checkpointGen == 0 {
 		cond = gcs.Conditions{DoesNotExist: true}
 	} else {
-		cond = gcs.Conditions{GenerationMatch: c.checkpointGen}
+		cond = gcs.Conditions{GenerationMatch: s.checkpointGen}
 	}
 
 	w := obj.If(cond).NewWriter(ctx)
-	if c.checkpointCacheControl != "" {
-		w.ObjectAttrs.CacheControl = c.checkpointCacheControl
+	if s.checkpointCacheControl != "" {
+		w.ObjectAttrs.CacheControl = s.checkpointCacheControl
 	}
 	if _, err := w.Write(newCPRaw); err != nil {
 		return err
@@ -169,16 +195,16 @@ func (c *Client) WriteCheckpoint(ctx context.Context, newCPRaw []byte) error {
 }
 
 // ReadCheckpoint reads from GCS and returns the contents of the log checkpoint.
-func (c *Client) ReadCheckpoint(ctx context.Context) ([]byte, error) {
-	bkt := c.gcsClient.Bucket(c.bucket)
+func (s *Storage) ReadCheckpoint(ctx context.Context) ([]byte, error) {
+	bkt := s.gcsClient.Bucket(s.bucket)
 	obj := bkt.Object(layout.CheckpointPath)
 
 	// Get the GCS generation number.
 	attrs, err := obj.Attrs(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("Object(%q).Attrs: %w", obj, err)
+		return nil, fmt.Errorf("Object(%q).Attrs: %w", obj.ObjectName(), err)
 	}
-	c.checkpointGen = attrs.Generation
+	s.checkpointGen = attrs.Generation
 
 	// Get the content of the checkpoint.
 	r, err := obj.NewReader(ctx)
@@ -193,15 +219,15 @@ func (c *Client) ReadCheckpoint(ctx context.Context) ([]byte, error) {
 // GetTile returns the tile at the given tile-level and tile-index.
 // If no complete tile exists at that location, it will attempt to find a
 // partial tile for the given tree size at that location.
-func (c *Client) GetTile(ctx context.Context, level, index, logSize uint64) (*api.Tile, error) {
+func (s *Storage) GetTile(ctx context.Context, level, index, logSize uint64) (*api.Tile, error) {
 	tileSize := layout.PartialTileSize(level, index, logSize)
-	bkt := c.gcsClient.Bucket(c.bucket)
+	bkt := s.gcsClient.Bucket(s.bucket)
 
 	// Pass an empty rootDir since we don't need this concept in GCS.
 	objName := filepath.Join(layout.TilePath("", level, index, tileSize))
 	r, err := bkt.Object(objName).NewReader(ctx)
 	if err != nil {
-		fmt.Printf("GetTile: failed to create reader for object %q in bucket %q: %v", objName, c.bucket, err)
+		fmt.Printf("GetTile: failed to create reader for object %q in bucket %q: %v", objName, s.bucket, err)
 
 		if errors.Is(err, gcs.ErrObjectNotExist) {
 			// Return the generic NotExist error so that tileCache.Visit can differentiate
@@ -214,7 +240,7 @@ func (c *Client) GetTile(ctx context.Context, level, index, logSize uint64) (*ap
 
 	t, err := io.ReadAll(r)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read tile object %q in bucket %q: %v", objName, c.bucket, err)
+		return nil, fmt.Errorf("failed to read tile object %q in bucket %q: %v", objName, s.bucket, err)
 	}
 
 	var tile api.Tile
@@ -224,172 +250,111 @@ func (c *Client) GetTile(ctx context.Context, level, index, logSize uint64) (*ap
 	return &tile, nil
 }
 
-// ScanSequenced calls the provided function once for each contiguous entry
-// in storage starting at begin.
-// The scan will abort if the function returns an error, otherwise it will
-// return the number of sequenced entries scanned.
-func (c *Client) ScanSequenced(ctx context.Context, begin uint64, f func(seq uint64, entry []byte) error) (uint64, error) {
-	end := begin
-	bkt := c.gcsClient.Bucket(c.bucket)
-
-	for {
-		// Pass an empty rootDir since we don't need this concept in GCS.
-		sp := filepath.Join(layout.SeqPath("", end))
-
-		// Read the object in an anonymous function so that the reader gets closed
-		// in each iteration of the outside for loop.
-		done, err := func() (bool, error) {
-			r, err := bkt.Object(sp).NewReader(ctx)
-			if errors.Is(err, gcs.ErrObjectNotExist) {
-				// we're done.
-				return true, nil
-			} else if err != nil {
-				return false, fmt.Errorf("ScanSequenced: failed to create reader for object %q in bucket %q: %v", sp, c.bucket, err)
-			}
-			defer r.Close()
-
-			entry, err := io.ReadAll(r)
-			if err != nil {
-				return false, fmt.Errorf("failed to read leafdata at index %d: %w", begin, err)
-			}
-
-			if err := f(end, entry); err != nil {
-				return false, err
-			}
-			end++
-
-			return false, nil
-		}()
-
-		if done {
-			return end - begin, nil
-		}
-		if err != nil {
-			return end - begin, err
-		}
+// GetEntryBundle retrieves the Nth entries bundle.
+// If size is != the max size of the bundle, a partial bundle is returned.
+func (s *Storage) GetEntryBundle(ctx context.Context, index, size uint64) ([]byte, error) {
+	bd, bf := layout.SeqPath("", index)
+	if size < uint64(s.entryBundleSize) {
+		bf = fmt.Sprintf("%s.%d", bf, size)
 	}
-}
-
-// GetObjects returns an object iterator for objects in the entriesDir.
-func (c *Client) GetObjects(ctx context.Context, entriesDir string) *gcs.ObjectIterator {
-	return c.gcsClient.Bucket(c.bucket).Objects(ctx, &gcs.Query{
-		Prefix: entriesDir,
-	})
+	objName := filepath.Join(bd, bf)
+	return s.GetObjectData(ctx, objName)
 }
 
 // GetObjectData returns the bytes of the input object path.
-func (c *Client) GetObjectData(ctx context.Context, obj string) ([]byte, error) {
-	r, err := c.gcsClient.Bucket(c.bucket).Object(obj).NewReader(ctx)
+func (s *Storage) GetObjectData(ctx context.Context, obj string) ([]byte, error) {
+	r, err := s.gcsClient.Bucket(s.bucket).Object(obj).NewReader(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("GetObjectData: failed to create reader for object %q in bucket %q: %q", obj, c.bucket, err)
+		return nil, fmt.Errorf("GetObjectData: failed to create reader for object %q in bucket %q: %q", obj, s.bucket, err)
 	}
 	defer r.Close()
 
 	return io.ReadAll(r)
 }
 
-// Sequence assigns the given leaf entry to the next available sequence number.
-// This method will attempt to silently squash duplicate leaves, but it cannot
-// be guaranteed that no duplicate entries will exist.
-// Returns the sequence number assigned to this leaf (if the leaf has already
-// been sequenced it will return the original sequence number and ErrDupeLeaf).
-func (c *Client) Sequence(ctx context.Context, leafhash []byte, leaf []byte) (uint64, error) {
-	// 1. Check for dupe leafhash
-	// 2. Create seq file
-	// 3. Create leafhash file containing assigned sequence number
+// Sequence commits to sequence numbers for an entry
+// Returns the sequence number assigned to the first entry in the batch, or an error.
+func (s *Storage) Sequence(ctx context.Context, leaf []byte) (uint64, error) {
+	return s.pool.Add(leaf)
+}
 
-	bkt := c.gcsClient.Bucket(c.bucket)
-
-	// Check for dupe leaf already present.
-	leafPath := filepath.Join(layout.LeafPath("", leafhash))
-	r, err := bkt.Object(leafPath).NewReader(ctx)
-	if err == nil {
-		defer r.Close()
-
-		// If there is one, it should contain the existing leaf's sequence number,
-		// so read that back and return it.
-		seqString, err := io.ReadAll(r)
-		if err != nil {
-			return 0, err
-		}
-
-		origSeq, err := strconv.ParseUint(string(seqString), 16, 64)
-		if err != nil {
-			return 0, err
-		}
-		return origSeq, log.ErrDupeLeaf
-	} else if !errors.Is(err, gcs.ErrObjectNotExist) {
+// sequenceBatch writes the entries from the provided batch into the entry bundle files of the log.
+//
+// This func starts filling entries bundles at the next available slot in the log, ensuring that the
+// sequenced entries are contiguous from the zeroth entry (i.e left-hand dense).
+// We try to minimise the number of partially complete entry bundles by writing entries in chunks rather
+// than one-by-one.
+func (s *Storage) sequenceBatch(ctx context.Context, batch writer.Batch) (uint64, error) {
+	size, _, err := s.CurrentTree(ctx)
+	if err != nil {
 		return 0, err
 	}
+	s.curSize = size
 
-	// Now try to sequence it, we may have to scan over some newly sequenced entries
-	// if Sequence has been called since the last time an Integrate/WriteCheckpoint
-	// was called.
-	for {
-		seq := c.nextSeq
-
-		// Try to write the sequence file
-		seqPath := filepath.Join(layout.SeqPath("", seq))
-		if _, err := bkt.Object(seqPath).Attrs(ctx); err == nil {
-			// That sequence number is in use, try the next one
-			c.nextSeq++
-			fmt.Printf("Seq num %d in use, continuing", seq)
-			continue
-		} else if !errors.Is(err, gcs.ErrObjectNotExist) {
-			return 0, fmt.Errorf("couldn't get attr of object %s: %q", seqPath, err)
+	if len(batch.Entries) == 0 {
+		return 0, nil
+	}
+	seq := s.curSize
+	bundleIndex, entriesInBundle := seq/uint64(s.entryBundleSize), seq%uint64(s.entryBundleSize)
+	bundle := &bytes.Buffer{}
+	if entriesInBundle > 0 {
+		// If the latest bundle is partial, we need to read the data it contains in for our newer, larger, bundle.
+		part, err := s.GetEntryBundle(ctx, bundleIndex, entriesInBundle)
+		if err != nil {
+			return 0, err
 		}
-
-		// Found the next available sequence number; write it.
-		//
-		// Conditionally write only if the object does not exist yet:
-		// https://cloud.google.com/storage/docs/request-preconditions#special-case.
-		// This may exist if there is more than one instance of the sequencer
-		// writing to the same log.
-		w := bkt.Object(seqPath).If(gcs.Conditions{DoesNotExist: true}).NewWriter(ctx)
-		if c.otherCacheControl != "" {
-			w.ObjectAttrs.CacheControl = c.otherCacheControl
-		}
-		if _, err := w.Write(leaf); err != nil {
-			return 0, fmt.Errorf("failed to write seq file: %w", err)
-		}
-		if err := w.Close(); err != nil {
-			var e *googleapi.Error
-			if ok := errors.As(err, &e); ok {
-				// Sequence number already in use.
-				if e.Code == http.StatusPreconditionFailed {
-					fmt.Printf("GCS writer close failed with sequence number %d: %v. Trying with number %d.\n",
-						c.nextSeq, err, c.nextSeq+1)
-					c.nextSeq++
-					continue
+		bundle.Write(part)
+	}
+	// Add new entries to the bundle
+	for _, e := range batch.Entries {
+		bundle.WriteString(base64.StdEncoding.EncodeToString(e))
+		bundle.WriteString("\n")
+		entriesInBundle++
+		if entriesInBundle == uint64(s.entryBundleSize) {
+			//  This bundle is full, so we need to write it out...
+			objName := filepath.Join(layout.SeqPath("", bundleIndex))
+			if err := s.createExclusive(ctx, objName, bundle.Bytes()); err != nil {
+				if !errors.Is(os.ErrExist, err) {
+					return 0, err
 				}
 			}
-
-			return 0, fmt.Errorf("couldn't close writer for object %q: %v", seqPath, err)
+			// ... and prepare the next entry bundle for any remaining entries in the batch
+			bundleIndex++
+			entriesInBundle = 0
+			bundle = &bytes.Buffer{}
 		}
-		fmt.Printf("Wrote leaf data to path %q\n", seqPath)
-
-		// Create a leafhash file containing the assigned sequence number.
-		// This isn't infallible though, if we crash after writing the sequence
-		// file above but before doing this, a resubmission of the same leafhash
-		// would be permitted.
-		wLeaf := bkt.Object(leafPath).NewWriter(ctx)
-		if c.otherCacheControl != "" {
-			w.ObjectAttrs.CacheControl = c.otherCacheControl
-		}
-		if _, err := wLeaf.Write([]byte(strconv.FormatUint(seq, 16))); err != nil {
-			return 0, fmt.Errorf("couldn't create leafhash object: %w", err)
-		}
-		if err := wLeaf.Close(); err != nil {
-			return 0, fmt.Errorf("couldn't close writer for object %q, %w", leafPath, err)
-		}
-
-		// All done!
-		return seq, nil
 	}
+	// If we have a partial bundle remaining once we've added all the entries from the batch,
+	// this needs writing out too.
+	if entriesInBundle > 0 {
+		bd, bf := layout.SeqPath("", bundleIndex)
+		bf = fmt.Sprintf("%s.%d", bf, entriesInBundle)
+		if err := s.createExclusive(ctx, filepath.Join(bd, bf), bundle.Bytes()); err != nil {
+			if !errors.Is(os.ErrExist, err) {
+				return 0, err
+			}
+		}
+	}
+
+	// For simplicitly, well in-line the integration of these new entries into the Merkle structure too.
+	return seq, s.doIntegrate(ctx, seq, batch.Entries)
+}
+
+// doIntegrate handles integrating new entries into the log, and updating the checkpoint.
+func (s *Storage) doIntegrate(ctx context.Context, from uint64, batch [][]byte) error {
+	newSize, newRoot, err := writer.Integrate(ctx, from, batch, s, rfc6962.DefaultHasher)
+	if err != nil {
+		klog.Errorf("Failed to integrate: %v", err)
+		return err
+	}
+	if err := s.newTree(ctx, newSize, newRoot); err != nil {
+		return fmt.Errorf("newTree: %v", err)
+	}
+	return nil
 }
 
 // assertContent checks that the content at `gcsPath` matches the passed in `data`.
-func (c *Client) assertContent(ctx context.Context, gcsPath string, data []byte) (equal bool, err error) {
+func (c *Storage) assertContent(ctx context.Context, gcsPath string, data []byte) (equal bool, err error) {
 	bkt := c.gcsClient.Bucket(c.bucket)
 
 	obj := bkt.Object(gcsPath)
@@ -416,7 +381,7 @@ func (c *Client) assertContent(ctx context.Context, gcsPath string, data []byte)
 // Fully populated tiles are stored at the path corresponding to the level &
 // index parameters, partially populated (i.e. right-hand edge) tiles are
 // stored with a .xx suffix where xx is the number of "tile leaves" in hex.
-func (c *Client) StoreTile(ctx context.Context, level, index uint64, tile *api.Tile) error {
+func (s *Storage) StoreTile(ctx context.Context, level, index uint64, tile *api.Tile) error {
 	tileSize := uint64(tile.NumLeaves)
 	klog.V(2).Infof("StoreTile: level %d index %x ts: %x", level, index, tileSize)
 	if tileSize == 0 || tileSize > 256 {
@@ -427,19 +392,21 @@ func (c *Client) StoreTile(ctx context.Context, level, index uint64, tile *api.T
 		return fmt.Errorf("failed to marshal tile: %w", err)
 	}
 
-	bkt := c.gcsClient.Bucket(c.bucket)
-
 	// Pass an empty rootDir since we don't need this concept in GCS.
 	tPath := filepath.Join(layout.TilePath("", level, index, tileSize%256))
-	obj := bkt.Object(tPath)
+	return s.createExclusive(ctx, tPath, t)
+}
 
+func (s *Storage) createExclusive(ctx context.Context, objName string, data []byte) error {
+	bkt := s.gcsClient.Bucket(s.bucket)
+	obj := bkt.Object(objName)
 	// Tiles, partial or full, should only be written once.
 	w := obj.If(gcs.Conditions{DoesNotExist: true}).NewWriter(ctx)
-	if c.otherCacheControl != "" {
-		w.ObjectAttrs.CacheControl = c.otherCacheControl
+	if s.otherCacheControl != "" {
+		w.ObjectAttrs.CacheControl = s.otherCacheControl
 	}
-	if _, err := w.Write(t); err != nil {
-		return fmt.Errorf("failed to write tile object %q to bucket %q: %w", tPath, c.bucket, err)
+	if _, err := w.Write(data); err != nil {
+		return fmt.Errorf("failed to write tile object %q to bucket %q: %w", objName, s.bucket, err)
 	}
 
 	if err := w.Close(); err != nil {
@@ -448,13 +415,13 @@ func (c *Client) StoreTile(ctx context.Context, level, index uint64, tile *api.T
 			// If we run into a precondition failure error, check that the object
 			// which exists contains the same content that we want to write.
 			if ee.Code == http.StatusPreconditionFailed {
-				if equal, err := c.assertContent(ctx, tPath, t); err != nil {
-					return fmt.Errorf("failed to read content of %q: %w", tPath, err)
+				if equal, err := s.assertContent(ctx, objName, data); err != nil {
+					return fmt.Errorf("failed to read content of %q: %w", objName, err)
 				} else if !equal {
-					return fmt.Errorf("assertion that tile content for %q has not changed failed", tPath)
+					return fmt.Errorf("assertion that rsource content for %q has not changed failed", objName)
 				}
 
-				klog.V(2).Infof("StoreTile: identical tile already exists for level %d index %x ts: %x", level, index, tileSize)
+				klog.V(2).Infof("StoreTile: identical resource already exists for %q:", objName)
 				return nil
 			}
 		default:
@@ -463,4 +430,29 @@ func (c *Client) StoreTile(ctx context.Context, level, index uint64, tile *api.T
 	}
 
 	return nil
+}
+
+func (s *Storage) CurrentTree(ctx context.Context) (uint64, []byte, error) {
+	b, err := s.ReadCheckpoint(ctx)
+	if err != nil {
+		return 0, nil, fmt.Errorf("ReadCheckpoint: %v", err)
+	}
+	cp, _, _, err := f_log.ParseCheckpoint(b, s.cpV.Name(), s.cpV)
+	if err != nil {
+		return 0, nil, err
+	}
+	return cp.Size, cp.Hash, nil
+}
+
+func (s *Storage) newTree(ctx context.Context, size uint64, hash []byte) error {
+	cp := &f_log.Checkpoint{
+		Origin: s.cpS.Name(),
+		Size:   size,
+		Hash:   hash,
+	}
+	n, err := note.Sign(&note.Note{Text: string(cp.Marshal())}, s.cpS)
+	if err != nil {
+		return err
+	}
+	return s.WriteCheckpoint(ctx, n)
 }
