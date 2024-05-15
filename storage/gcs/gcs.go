@@ -24,6 +24,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/AlCutter/betty/log/writer"
@@ -55,6 +56,8 @@ type CurrentTreeFunc func() (uint64, []byte, error)
 //
 // The functions on this struct are not thread-safe.
 type Storage struct {
+	mu sync.Mutex
+
 	gcsClient *gcs.Client
 	projectID string
 	// bucket is the name of the bucket where tree data will be stored.
@@ -285,6 +288,9 @@ func (s *Storage) Sequence(ctx context.Context, leaf []byte) (uint64, error) {
 // We try to minimise the number of partially complete entry bundles by writing entries in chunks rather
 // than one-by-one.
 func (s *Storage) sequenceBatch(ctx context.Context, batch writer.Batch) (uint64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	size, _, err := s.CurrentTree(ctx)
 	if err != nil {
 		return 0, err
@@ -312,6 +318,7 @@ func (s *Storage) sequenceBatch(ctx context.Context, batch writer.Batch) (uint64
 		entriesInBundle++
 		if entriesInBundle == uint64(s.entryBundleSize) {
 			//  This bundle is full, so we need to write it out...
+			klog.V(1).Infof("Bundle idx %x is full", bundleIndex)
 			objName := filepath.Join(layout.SeqPath("", bundleIndex))
 			if err := s.createExclusive(ctx, objName, bundle.Bytes()); err != nil {
 				if !errors.Is(os.ErrExist, err) {
@@ -322,11 +329,13 @@ func (s *Storage) sequenceBatch(ctx context.Context, batch writer.Batch) (uint64
 			bundleIndex++
 			entriesInBundle = 0
 			bundle = &bytes.Buffer{}
+			klog.V(1).Infof("Starting bundle idx %d", bundleIndex)
 		}
 	}
 	// If we have a partial bundle remaining once we've added all the entries from the batch,
 	// this needs writing out too.
 	if entriesInBundle > 0 {
+		klog.V(1).Infof("Writing partial bundle idx %d.%d is full", bundleIndex, entriesInBundle)
 		bd, bf := layout.SeqPath("", bundleIndex)
 		bf = fmt.Sprintf("%s.%d", bf, entriesInBundle)
 		if err := s.createExclusive(ctx, filepath.Join(bd, bf), bundle.Bytes()); err != nil {
@@ -418,7 +427,7 @@ func (s *Storage) createExclusive(ctx context.Context, objName string, data []by
 				if equal, err := s.assertContent(ctx, objName, data); err != nil {
 					return fmt.Errorf("failed to read content of %q: %w", objName, err)
 				} else if !equal {
-					return fmt.Errorf("assertion that rsource content for %q has not changed failed", objName)
+					return fmt.Errorf("assertion that resource content for %q has not changed failed", objName)
 				}
 
 				klog.V(2).Infof("StoreTile: identical resource already exists for %q:", objName)
