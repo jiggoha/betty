@@ -16,8 +16,9 @@ import (
 )
 
 var (
-	batchSize   = flag.Int("batch_size", 1, "Size of batch before flushing")
-	batchMaxAge = flag.Duration("batch_max_age", 100*time.Millisecond, "Max age for batch entries before flushing")
+	bundleSize   = flag.Int("bundle_size", 256, "Size of leaf bundle")
+	batchMaxSize = flag.Int("batch_max_size", 1024, "Size of batch before flushing")
+	batchMaxAge  = flag.Duration("batch_max_age", 100*time.Millisecond, "Max age for batch entries before flushing")
 
 	project = flag.String("project", os.Getenv("GOOGLE_CLOUD_PROJECT"), "GCP Project, take from env if unset")
 	bucket  = flag.String("bucket", "", "Bucket to use for storing log")
@@ -89,10 +90,10 @@ func main() {
 	opts := gcs.StorageOpts{
 		ProjectID:       *project,
 		Bucket:          *bucket,
-		EntryBundleSize: *batchSize,
+		EntryBundleSize: *bundleSize,
 	}
 	sKey, vKey := keysFromFlag()
-	gcsStorage := gcs.New(ctx, opts, *batchMaxAge, vKey, sKey)
+	gcsStorage := gcs.New(ctx, opts, *batchMaxSize, *batchMaxAge, vKey, sKey)
 	if e, err := gcsStorage.BucketExists(ctx, opts.Bucket); err != nil {
 		klog.Exitf("Failed to check whether bucket %q exists: %v", opts.Bucket, err)
 	} else if !e {
