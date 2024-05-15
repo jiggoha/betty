@@ -135,10 +135,10 @@ func main() {
 
 	http.HandleFunc("/", func(resp http.ResponseWriter, req *http.Request) {
 		p := req.URL.Path[1:] // strip off leading slash
-		klog.Infof("HTTP: %v", p)
+		klog.V(2).Infof("HTTP: %v", p)
 		b, err := gcsStorage.GetObjectData(ctx, p)
 		if err != nil {
-			klog.Infof("HTTP: %v: %v", p, err)
+			klog.V(2).Infof("HTTP: %v: %v", p, err)
 			resp.WriteHeader(http.StatusBadRequest)
 			return
 		}
