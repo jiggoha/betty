@@ -347,7 +347,7 @@ func (s *Storage) doIntegrate(ctx context.Context, from uint64, batch [][]byte) 
 		klog.Errorf("Failed to integrate: %v", err)
 		return err
 	}
-	if err := s.newTree(ctx, newSize, newRoot); err != nil {
+	if err := s.NewTree(ctx, newSize, newRoot); err != nil {
 		return fmt.Errorf("newTree: %v", err)
 	}
 	return nil
@@ -444,7 +444,7 @@ func (s *Storage) CurrentTree(ctx context.Context) (uint64, []byte, error) {
 	return cp.Size, cp.Hash, nil
 }
 
-func (s *Storage) newTree(ctx context.Context, size uint64, hash []byte) error {
+func (s *Storage) NewTree(ctx context.Context, size uint64, hash []byte) error {
 	cp := &f_log.Checkpoint{
 		Origin: s.cpS.Name(),
 		Size:   size,
