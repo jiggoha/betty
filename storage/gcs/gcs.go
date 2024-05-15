@@ -121,7 +121,7 @@ func New(ctx context.Context, opts StorageOpts, batchMaxAge time.Duration, cpV n
 	return r
 }
 
-func (c *Storage) bucketExists(ctx context.Context, bucket string) (bool, error) {
+func (c *Storage) BucketExists(ctx context.Context, bucket string) (bool, error) {
 	it := c.gcsClient.Buckets(ctx, c.projectID)
 	for {
 		bAttrs, err := it.Next()
@@ -141,7 +141,7 @@ func (c *Storage) bucketExists(ctx context.Context, bucket string) (bool, error)
 // Create creates a new GCS bucket and returns an error on failure.
 func (s *Storage) Create(ctx context.Context, bucket string) error {
 	// Check if the bucket already exists.
-	exists, err := s.bucketExists(ctx, bucket)
+	exists, err := s.BucketExists(ctx, bucket)
 	if err != nil {
 		return err
 	}
