@@ -102,7 +102,7 @@ type StorageOpts struct {
 
 // New returns a Client which allows interaction with the log stored in
 // the specified bucket on GCS.
-func New(ctx context.Context, opts StorageOpts, batchMaxAge time.Duration, cpV note.Verifier, cpS note.Signer) *Storage {
+func New(ctx context.Context, opts StorageOpts, batchMaxSize int, batchMaxAge time.Duration, cpV note.Verifier, cpS note.Signer) *Storage {
 	c, err := gcs.NewClient(ctx)
 	if err != nil {
 		klog.Exitf("Failed to create GCS storage: %v", err)
@@ -119,7 +119,7 @@ func New(ctx context.Context, opts StorageOpts, batchMaxAge time.Duration, cpV n
 		cpV:                    cpV,
 		cpS:                    cpS,
 	}
-	r.pool = writer.NewPool(opts.EntryBundleSize, batchMaxAge, r.sequenceBatch)
+	r.pool = writer.NewPool(batchMaxSize, batchMaxAge, r.sequenceBatch)
 
 	return r
 }
