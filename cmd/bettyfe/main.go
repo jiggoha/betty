@@ -129,10 +129,18 @@ func main() {
 		}
 		w.Write([]byte(fmt.Sprintf("%d\n", idx)))
 	})
-	/*
-		fs := http.FileServer(http.Dir(*path))
-		http.Handle("GET /", fs)
-	*/
+
+	http.HandleFunc("/", func(resp http.ResponseWriter, req *http.Request) {
+		p := req.URL.Path[1:] // strip off leading slash
+		klog.Infof("HTTP: %v", p)
+		b, err := gcsStorage.GetObjectData(ctx, p)
+		if err != nil {
+			klog.Infof("HTTP: %v: %v", p, err)
+			resp.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		resp.Write(b)
+	})
 
 	go printStats(ctx, s.CurrentTree, l)
 	if err := http.ListenAndServe(*listen, http.DefaultServeMux); err != nil {
