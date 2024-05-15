@@ -95,7 +95,16 @@ func main() {
 		EntryBundleSize: *batchSize,
 	}
 	sKey, vKey := keysFromFlag()
-	var s Storage = gcs.New(ctx, opts, *batchMaxAge, vKey, sKey)
+	gcsStorage := gcs.New(ctx, opts, *batchMaxAge, vKey, sKey)
+	if e, err := gcsStorage.BucketExists(ctx, opts.Bucket); err != nil {
+		klog.Exitf("Failed to check whether bucket %q exists: %v", opts.Bucket, err)
+	} else if !e {
+		if err := gcsStorage.Create(ctx, opts.Bucket); err != nil {
+			klog.Exitf("Failed to create bucket %q: %v", opts.Bucket, err)
+		}
+	}
+
+	var s Storage = gcsStorage
 
 	if _, _, err := s.CurrentTree(ctx); err != nil {
 		klog.Infof("ct: %v", err)
