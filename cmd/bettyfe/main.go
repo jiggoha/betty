@@ -39,6 +39,7 @@ type Storage interface {
 	// Implementations are expected to integrate these new entries in a "timely" fashion.
 	Sequence(context.Context, []byte) (uint64, error)
 	CurrentTree(context.Context) (uint64, []byte, error)
+	NewTree(context.Context, uint64, []byte) error
 }
 
 type latency struct {
@@ -96,14 +97,12 @@ func main() {
 	sKey, vKey := keysFromFlag()
 	var s Storage = gcs.New(ctx, opts, *batchMaxAge, vKey, sKey)
 
-	/*
-		if _, _, err := ct(); err != nil {
-			klog.Infof("ct: %v", err)
-			if err := nt(0, []byte("Empty")); err != nil {
-				klog.Exitf("Failed to initialise log: %v", err)
-			}
+	if _, _, err := s.CurrentTree(ctx); err != nil {
+		klog.Infof("ct: %v", err)
+		if err := s.NewTree(ctx, 0, []byte("Empty")); err != nil {
+			klog.Exitf("Failed to initialise log: %v", err)
 		}
-	*/
+	}
 	l := &latency{}
 
 	http.HandleFunc("POST /add", func(w http.ResponseWriter, r *http.Request) {
