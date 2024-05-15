@@ -383,6 +383,7 @@ func (c *Storage) assertContent(ctx context.Context, gcsPath string, data []byte
 	if bytes.Equal(gcsData, data) {
 		return true, nil
 	}
+	klog.V(2).Infof("assertContent(%q):\nGCS:\n%s\nWrite:\n%s", gcsPath, gcsData, data)
 	return false, nil
 }
 
