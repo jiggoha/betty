@@ -18,12 +18,9 @@ import (
 )
 
 var (
-	leavesPerSecond = flag.Int64("leaves_per_second", 10, "How many leaves to generate per second")
-	leafSize        = flag.Int("leaf_size", 1024, "Leaf size in bytes")
-	numWriters      = flag.Int("num_writers", 100, "Number of parallel writers")
-	path            = flag.String("path", "/tmp/log", "Path to log root diretory")
-	batchSize       = flag.Int("batch_size", 1, "Size of batch before flushing")
-	batchMaxAge     = flag.Duration("batch_max_age", 100*time.Millisecond, "Max age for batch entries before flushing")
+	path        = flag.String("path", "/tmp/log", "Path to log root diretory")
+	batchSize   = flag.Int("batch_size", 1, "Size of batch before flushing")
+	batchMaxAge = flag.Duration("batch_max_age", 100*time.Millisecond, "Max age for batch entries before flushing")
 
 	listen = flag.String("listen", ":2024", "Address:port to listen on")
 
