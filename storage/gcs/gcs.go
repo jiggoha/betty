@@ -18,9 +18,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/gob"
 	"errors"
 	"fmt"
 	"io"
+	"math/rand"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -36,8 +38,15 @@ import (
 	"google.golang.org/api/iterator"
 	"k8s.io/klog/v2"
 
+	"cloud.google.com/go/storage"
 	gcs "cloud.google.com/go/storage"
 	f_log "github.com/transparency-dev/formats/log"
+)
+
+const (
+	ringSize     = 10
+	ringFormat   = "__seqRing/%04d"
+	ringHeadPath = "__seqRing/head"
 )
 
 // NewTreeFunc is the signature of a function which receives information about newly integrated trees.
@@ -120,6 +129,22 @@ func New(ctx context.Context, opts StorageOpts, batchMaxSize int, batchMaxAge ti
 		cpS:                    cpS,
 	}
 	r.pool = writer.NewPool(batchMaxSize, batchMaxAge, r.sequenceBatch)
+	go func() {
+		t := time.NewTicker(time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+				defer cancel()
+				if err := r.assignSequenceAndIngegrate(cctx); err != nil {
+					klog.Errorf("assignSequenceAndIntegrate: %v", err)
+				}
+			}
+		}
+	}()
 
 	return r
 }
@@ -199,24 +224,17 @@ func (s *Storage) WriteCheckpoint(ctx context.Context, newCPRaw []byte) error {
 
 // ReadCheckpoint reads from GCS and returns the contents of the log checkpoint.
 func (s *Storage) ReadCheckpoint(ctx context.Context) ([]byte, error) {
-	bkt := s.gcsClient.Bucket(s.bucket)
-	obj := bkt.Object(layout.CheckpointPath)
+	b, _, err := s.readCheckpoint(ctx)
+	return b, err
+}
 
-	// Get the GCS generation number.
-	attrs, err := obj.Attrs(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("Object(%q).Attrs: %w", obj.ObjectName(), err)
+func (s *Storage) readCheckpoint(ctx context.Context) ([]byte, int64, error) {
+	cpRaw, mgen, err := s.GetObjectData(ctx, layout.CheckpointPath)
+	if err == nil {
+		s.checkpointGen = mgen
 	}
-	s.checkpointGen = attrs.Generation
 
-	// Get the content of the checkpoint.
-	r, err := obj.NewReader(ctx)
-	if err != nil {
-		return nil, err
-	}
-	defer r.Close()
-
-	return io.ReadAll(r)
+	return cpRaw, mgen, err
 }
 
 // GetTile returns the tile at the given tile-level and tile-index.
@@ -230,8 +248,6 @@ func (s *Storage) GetTile(ctx context.Context, level, index, logSize uint64) (*a
 	objName := filepath.Join(layout.TilePath("", level, index, tileSize))
 	r, err := bkt.Object(objName).NewReader(ctx)
 	if err != nil {
-		fmt.Printf("GetTile: failed to create reader for object %q in bucket %q: %v", objName, s.bucket, err)
-
 		if errors.Is(err, gcs.ErrObjectNotExist) {
 			// Return the generic NotExist error so that tileCache.Visit can differentiate
 			// between this and other errors.
@@ -261,24 +277,49 @@ func (s *Storage) GetEntryBundle(ctx context.Context, index, size uint64) ([]byt
 		bf = fmt.Sprintf("%s.%d", bf, size)
 	}
 	objName := filepath.Join(bd, bf)
-	return s.GetObjectData(ctx, objName)
+	d, _, err := s.GetObjectData(ctx, objName)
+	return d, err
 }
 
 // GetObjectData returns the bytes of the input object path.
-func (s *Storage) GetObjectData(ctx context.Context, obj string) ([]byte, error) {
+func (s *Storage) GetObjectData(ctx context.Context, obj string) ([]byte, int64, error) {
 	r, err := s.gcsClient.Bucket(s.bucket).Object(obj).NewReader(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("GetObjectData: failed to create reader for object %q in bucket %q: %q", obj, s.bucket, err)
+		return nil, -1, fmt.Errorf("GetObjectData: failed to create reader for object %q in bucket %q: %w", obj, s.bucket, err)
 	}
 	defer r.Close()
 
-	return io.ReadAll(r)
+	d, err := io.ReadAll(r)
+	return d, r.Attrs.Generation, err
 }
 
 // Sequence commits to sequence numbers for an entry
 // Returns the sequence number assigned to the first entry in the batch, or an error.
 func (s *Storage) Sequence(ctx context.Context, leaf []byte) (uint64, error) {
 	return s.pool.Add(leaf)
+}
+
+func (s *Storage) flushBatch(ctx context.Context, batch writer.Batch) error {
+	b := &bytes.Buffer{}
+	e := gob.NewEncoder(b)
+	if err := e.Encode(batch); err != nil {
+		return fmt.Errorf("failed to serialise batch: %v", err)
+	}
+	data := b.Bytes()
+	start := rand.Intn(ringSize)
+	for i := 0; i < ringSize; i++ {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		idx := (start + i) % ringSize
+		if err := s.writeIfNotExists(ctx, fmt.Sprintf(ringFormat, idx), data); err != nil {
+			continue
+		}
+	}
+	return errors.New("pushback - no slots free")
 }
 
 // sequenceBatch writes the entries from the provided batch into the entry bundle files of the log.
@@ -288,65 +329,156 @@ func (s *Storage) Sequence(ctx context.Context, leaf []byte) (uint64, error) {
 // We try to minimise the number of partially complete entry bundles by writing entries in chunks rather
 // than one-by-one.
 func (s *Storage) sequenceBatch(ctx context.Context, batch writer.Batch) (uint64, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	size, _, err := s.CurrentTree(ctx)
-	if err != nil {
+	if err := s.flushBatch(ctx, batch); err != nil {
 		return 0, err
 	}
-	s.curSize = size
 
-	if len(batch.Entries) == 0 {
-		return 0, nil
+	// TODO: Wait for integration to complete.
+	// Read hash -> seq files, and return.
+	return 0, nil
+}
+
+type ringInfo struct {
+	Pos int
+	Seq uint64
+}
+
+func (s *Storage) writeRingInfo(ctx context.Context, riGen int64, ri ringInfo) error {
+	b := &bytes.Buffer{}
+	if err := gob.NewEncoder(b).Encode(ri); err != nil {
+		return err
 	}
-	seq := s.curSize
-	bundleIndex, entriesInBundle := seq/uint64(s.entryBundleSize), seq%uint64(s.entryBundleSize)
-	bundle := &bytes.Buffer{}
-	if entriesInBundle > 0 {
-		// If the latest bundle is partial, we need to read the data it contains in for our newer, larger, bundle.
-		part, err := s.GetEntryBundle(ctx, bundleIndex, entriesInBundle)
-		if err != nil {
-			return 0, err
+	return s.writeIfGen(ctx, ringHeadPath, riGen, b.Bytes())
+}
+
+func (s *Storage) getRingInfo(ctx context.Context) (ringInfo, int64, error) {
+	riGob, riGen, err := s.GetObjectData(ctx, ringHeadPath)
+	if errors.Is(err, storage.ErrObjectNotExist) {
+		return ringInfo{}, 0, nil
+	} else if err != nil {
+		return ringInfo{}, -1, err
+	}
+	ri := ringInfo{}
+	if err := gob.NewDecoder(bytes.NewReader(riGob)).Decode(&ri); err != nil {
+		return ringInfo{}, -1, err
+	}
+	return ri, riGen, nil
+
+}
+
+func (s *Storage) assignSequenceAndIngegrate(ctx context.Context) error {
+	entries := [][]byte{}
+	curSize, _, _, err := s.currentTreeGen(ctx)
+	if err != nil {
+		return fmt.Errorf("currentTreeGen: %v", err)
+	}
+	s.curSize = curSize
+	now := time.Now()
+	numAdded := 0
+
+	klog.Infof("SA: Starting sequence & integrate...")
+	defer func() {
+		d := time.Now().Sub(now)
+		qps := 0.0
+		if d > 0 {
+			qps = float64(numAdded) / float64(d/time.Second)
 		}
-		bundle.Write(part)
-	}
-	// Add new entries to the bundle
-	for _, e := range batch.Entries {
-		bundle.WriteString(base64.StdEncoding.EncodeToString(e))
-		bundle.WriteString("\n")
-		entriesInBundle++
-		if entriesInBundle == uint64(s.entryBundleSize) {
-			//  This bundle is full, so we need to write it out...
-			klog.V(1).Infof("Bundle idx %x is full", bundleIndex)
-			objName := filepath.Join(layout.SeqPath("", bundleIndex))
-			if err := s.createExclusive(ctx, objName, bundle.Bytes()); err != nil {
+		klog.Infof("SA: Sequencing @ %.1f took %v", qps, d)
+	}()
+	deadline := time.Now().Add(1 * time.Second)
+
+	for time.Now().Before(deadline) {
+		ri, riGen, err := s.getRingInfo(ctx)
+		if err != nil {
+			return fmt.Errorf("getRingInfo: %v", err)
+		}
+		ringPath := fmt.Sprintf(ringFormat, ri.Pos)
+		klog.V(1).Infof("sequencing @%d qps from %s", ri.Seq, ringPath)
+		batchGob, batchGen, err := s.GetObjectData(ctx, ringPath)
+		if errors.Is(err, storage.ErrObjectNotExist) {
+			break
+			//return nil
+		} else if err != nil {
+			return fmt.Errorf("failed to read ring entry %d: %v", ri.Pos, err)
+		}
+
+		g := gob.NewDecoder(bytes.NewReader(batchGob))
+		batch := writer.Batch{}
+		if err := g.Decode(&batch); err != nil {
+			return fmt.Errorf("failed to deserialise batch: %v", err)
+		}
+
+		if len(batch.Entries) == 0 {
+			break
+			//return nil
+		}
+
+		bundleIndex, entriesInBundle := ri.Seq/uint64(s.entryBundleSize), ri.Seq%uint64(s.entryBundleSize)
+		bundle := &bytes.Buffer{}
+		if entriesInBundle > 0 {
+			// If the latest bundle is partial, we need to read the data it contains in for our newer, larger, bundle.
+			part, err := s.GetEntryBundle(ctx, bundleIndex, entriesInBundle)
+			if err != nil {
+				return err
+			}
+			bundle.Write(part)
+		}
+		// Add new entries to the bundle
+		// TODO: write out hash -> seq objects.
+		for _, e := range batch.Entries {
+			entries = append(entries, e)
+			bundle.WriteString(base64.StdEncoding.EncodeToString(e))
+			bundle.WriteString("\n")
+			entriesInBundle++
+			ri.Seq++
+			numAdded++
+			if entriesInBundle == uint64(s.entryBundleSize) {
+				//  This bundle is full, so we need to write it out...
+				klog.V(1).Infof("Bundle idx %x is full", bundleIndex)
+				objName := filepath.Join(layout.SeqPath("", bundleIndex))
+				if err := s.createExclusive(ctx, objName, bundle.Bytes()); err != nil {
+					if !errors.Is(os.ErrExist, err) {
+						return err
+					}
+				}
+				// ... and prepare the next entry bundle for any remaining entries in the batch
+				bundleIndex++
+				entriesInBundle = 0
+				bundle = &bytes.Buffer{}
+				klog.V(1).Infof("Starting bundle idx %d", bundleIndex)
+			}
+		}
+		// If we have a partial bundle remaining once we've added all the entries from the batch,
+		// this needs writing out too.
+		if entriesInBundle > 0 {
+			klog.V(1).Infof("Writing partial bundle idx %d.%d", bundleIndex, entriesInBundle)
+			bd, bf := layout.SeqPath("", bundleIndex)
+			bf = fmt.Sprintf("%s.%d", bf, entriesInBundle)
+			if err := s.createExclusive(ctx, filepath.Join(bd, bf), bundle.Bytes()); err != nil {
 				if !errors.Is(os.ErrExist, err) {
-					return 0, err
+					return err
 				}
 			}
-			// ... and prepare the next entry bundle for any remaining entries in the batch
-			bundleIndex++
-			entriesInBundle = 0
-			bundle = &bytes.Buffer{}
-			klog.V(1).Infof("Starting bundle idx %d", bundleIndex)
 		}
-	}
-	// If we have a partial bundle remaining once we've added all the entries from the batch,
-	// this needs writing out too.
-	if entriesInBundle > 0 {
-		klog.V(1).Infof("Writing partial bundle idx %d.%d is full", bundleIndex, entriesInBundle)
-		bd, bf := layout.SeqPath("", bundleIndex)
-		bf = fmt.Sprintf("%s.%d", bf, entriesInBundle)
-		if err := s.createExclusive(ctx, filepath.Join(bd, bf), bundle.Bytes()); err != nil {
-			if !errors.Is(os.ErrExist, err) {
-				return 0, err
-			}
-		}
-	}
 
-	// For simplicitly, well in-line the integration of these new entries into the Merkle structure too.
-	return seq, s.doIntegrate(ctx, seq, batch.Entries)
+		ri.Pos = (ri.Pos + 1) % ringSize
+		if err := s.writeRingInfo(ctx, riGen, ri); err != nil {
+			return fmt.Errorf("writeRingInfo: %v", err)
+		}
+		if err := s.removeGen(ctx, ringPath, batchGen); err != nil {
+			return fmt.Errorf("removeGen(%s@%d): %v", ringPath, batchGen, err)
+		}
+
+	}
+	klog.Infof("SA: Doing integrate... (after %v)", time.Now().Sub(now))
+	return s.doIntegrate(ctx, curSize, entries)
+}
+
+func (s *Storage) removeGen(ctx context.Context, gcsPath string, gen int64) error {
+	bkt := s.gcsClient.Bucket(s.bucket)
+	obj := bkt.Object(gcsPath)
+	return obj.If(gcs.Conditions{GenerationMatch: gen}).Delete(ctx)
+
 }
 
 // doIntegrate handles integrating new entries into the log, and updating the checkpoint.
@@ -407,6 +539,39 @@ func (s *Storage) StoreTile(ctx context.Context, level, index uint64, tile *api.
 	return s.createExclusive(ctx, tPath, t)
 }
 
+func (s *Storage) writeIfGen(ctx context.Context, objName string, gen int64, data []byte) error {
+	bkt := s.gcsClient.Bucket(s.bucket)
+	obj := bkt.Object(objName)
+
+	var cond gcs.Conditions
+	if gen == 0 {
+		cond = gcs.Conditions{DoesNotExist: true}
+	} else {
+		cond = gcs.Conditions{GenerationMatch: gen}
+	}
+
+	w := obj.If(cond).NewWriter(ctx)
+	if _, err := w.Write(data); err != nil {
+		return fmt.Errorf("failed to write object %q to bucket %q: %w", objName, s.bucket, err)
+	}
+
+	return w.Close()
+}
+
+func (s *Storage) writeIfNotExists(ctx context.Context, objName string, data []byte) error {
+	bkt := s.gcsClient.Bucket(s.bucket)
+	obj := bkt.Object(objName)
+
+	cond := gcs.Conditions{DoesNotExist: true}
+
+	w := obj.If(cond).NewWriter(ctx)
+	if _, err := w.Write(data); err != nil {
+		return fmt.Errorf("failed to write object %q to bucket %q: %w", objName, s.bucket, err)
+	}
+
+	return w.Close()
+}
+
 func (s *Storage) createExclusive(ctx context.Context, objName string, data []byte) error {
 	bkt := s.gcsClient.Bucket(s.bucket)
 	obj := bkt.Object(objName)
@@ -431,7 +596,7 @@ func (s *Storage) createExclusive(ctx context.Context, objName string, data []by
 					return fmt.Errorf("assertion that resource content for %q has not changed failed", objName)
 				}
 
-				klog.V(2).Infof("StoreTile: identical resource already exists for %q:", objName)
+				klog.V(2).Infof("createExclusive: identical resource already exists for %q:", objName)
 				return nil
 			}
 		default:
@@ -443,15 +608,20 @@ func (s *Storage) createExclusive(ctx context.Context, objName string, data []by
 }
 
 func (s *Storage) CurrentTree(ctx context.Context) (uint64, []byte, error) {
-	b, err := s.ReadCheckpoint(ctx)
+	size, hash, _, err := s.currentTreeGen(ctx)
+	return size, hash, err
+}
+
+func (s *Storage) currentTreeGen(ctx context.Context) (uint64, []byte, int64, error) {
+	cpRaw, cpGen, err := s.readCheckpoint(ctx)
 	if err != nil {
-		return 0, nil, fmt.Errorf("ReadCheckpoint: %v", err)
+		return 0, nil, -1, fmt.Errorf("readCheckpoint: %v", err)
 	}
-	cp, _, _, err := f_log.ParseCheckpoint(b, s.cpV.Name(), s.cpV)
+	cp, _, _, err := f_log.ParseCheckpoint(cpRaw, s.cpV.Name(), s.cpV)
 	if err != nil {
-		return 0, nil, err
+		return 0, nil, -1, err
 	}
-	return cp.Size, cp.Hash, nil
+	return cp.Size, cp.Hash, cpGen, nil
 }
 
 func (s *Storage) NewTree(ctx context.Context, size uint64, hash []byte) error {
