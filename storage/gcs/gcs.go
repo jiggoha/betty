@@ -139,7 +139,7 @@ func New(ctx context.Context, opts StorageOpts, batchMaxSize int, batchMaxAge ti
 			case <-t.C:
 				cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 				defer cancel()
-				if err := r.assignSequenceAndIngegrate(cctx); err != nil {
+				if err := r.assignSequenceAndIntegrate(cctx); err != nil {
 					klog.Errorf("assignSequenceAndIntegrate: %v", err)
 				}
 			}
@@ -366,7 +366,7 @@ func (s *Storage) getRingInfo(ctx context.Context) (ringInfo, int64, error) {
 
 }
 
-func (s *Storage) assignSequenceAndIngegrate(ctx context.Context) error {
+func (s *Storage) assignSequenceAndIntegrate(ctx context.Context) error {
 	entries := [][]byte{}
 	curSize, _, _, err := s.currentTreeGen(ctx)
 	if err != nil {
@@ -378,12 +378,12 @@ func (s *Storage) assignSequenceAndIngegrate(ctx context.Context) error {
 
 	klog.Infof("SA: Starting sequence & integrate...")
 	defer func() {
-		d := time.Now().Sub(now)
+		d := float64(time.Now().Sub(now) / time.Second)
 		qps := 0.0
 		if d > 0 {
-			qps = float64(numAdded) / float64(d/time.Second)
+			qps = float64(numAdded) / d
 		}
-		klog.Infof("SA: Sequencing @ %.1f took %v", qps, d)
+		klog.Infof("SA: Sequencing & integrate @ %.1f qps took %vs", qps, d)
 	}()
 	deadline := time.Now().Add(1 * time.Second)
 
@@ -470,7 +470,7 @@ func (s *Storage) assignSequenceAndIngegrate(ctx context.Context) error {
 		}
 
 	}
-	klog.Infof("SA: Doing integrate... (after %v)", time.Now().Sub(now))
+	klog.Infof("SA: Doing integrate... (after %vs)", time.Now().Sub(now))
 	return s.doIntegrate(ctx, curSize, entries)
 }
 
