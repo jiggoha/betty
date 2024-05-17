@@ -17,12 +17,13 @@ package gcs
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/base64"
 	"encoding/gob"
 	"errors"
 	"fmt"
 	"io"
-	"math/rand"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -38,7 +39,9 @@ import (
 	"google.golang.org/api/iterator"
 	"k8s.io/klog/v2"
 
-	"cloud.google.com/go/storage"
+	"cloud.google.com/go/cloudsqlconn"
+	"github.com/go-sql-driver/mysql"
+
 	gcs "cloud.google.com/go/storage"
 	f_log "github.com/transparency-dev/formats/log"
 )
@@ -71,6 +74,9 @@ type Storage struct {
 	projectID string
 	// bucket is the name of the bucket where tree data will be stored.
 	bucket string
+
+	dbPool *sql.DB
+
 	// nextSeq is a hint to the Sequence func as to what the next available
 	// sequence number is to help performance.
 	// Note that nextSeq may be <= than the actual next available number, but
@@ -99,6 +105,12 @@ type StorageOpts struct {
 	ProjectID string
 	// Bucket is the name of the bucket to use for storing log state.
 	Bucket string
+	// DBConn is the ConnectionName of the CloudSQL database to use.
+	DBConn string
+	DBUser string
+	DBPass string
+	DBName string
+
 	// CheckpointCacheControl, if set, will cause the Cache-Control header associated with the
 	// checkpoint object to be set to this value. If unset, the current GCP default will be used.
 	CheckpointCacheControl string
@@ -117,10 +129,33 @@ func New(ctx context.Context, opts StorageOpts, batchMaxSize int, batchMaxAge ti
 		klog.Exitf("Failed to create GCS storage: %v", err)
 	}
 
+	d, err := cloudsqlconn.NewDialer(context.Background())
+	if err != nil {
+		klog.Exitf("cloudsqlconn.NewDialer: %v", err)
+	}
+	mysql.RegisterDialContext("cloudsqlconn",
+		func(ctx context.Context, addr string) (net.Conn, error) {
+			return d.Dial(ctx, opts.DBConn)
+		})
+
+	dbURI := fmt.Sprintf("%s:%s@cloudsqlconn(localhost:3306)/%s?parseTime=true",
+		opts.DBUser, opts.DBPass, opts.DBName)
+
+	dbPool, err := sql.Open("mysql", dbURI)
+	if err != nil {
+		klog.Exitf("Failed to open CloudSQL: %v", err)
+	}
+
+	if err := initDB(ctx, dbPool); err != nil {
+		klog.Exitf("Failed to init DB: %v", err)
+	}
+
 	r := &Storage{
-		gcsClient:              c,
-		projectID:              opts.ProjectID,
-		bucket:                 opts.Bucket,
+		gcsClient: c,
+		projectID: opts.ProjectID,
+		bucket:    opts.Bucket,
+		dbPool:    dbPool,
+
 		checkpointGen:          0,
 		checkpointCacheControl: opts.CheckpointCacheControl,
 		otherCacheControl:      opts.OtherCacheControl,
@@ -130,23 +165,62 @@ func New(ctx context.Context, opts StorageOpts, batchMaxSize int, batchMaxAge ti
 	}
 	r.pool = writer.NewPool(batchMaxSize, batchMaxAge, r.sequenceBatch)
 	go func() {
-		t := time.NewTicker(time.Second)
+		t := time.NewTicker(5 * time.Second)
 		defer t.Stop()
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case <-t.C:
-				cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-				defer cancel()
-				if err := r.assignSequenceAndIntegrate(cctx); err != nil {
-					klog.Errorf("assignSequenceAndIntegrate: %v", err)
+				for {
+					cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+					defer cancel()
+					if more, err := r.assignSequenceAndIntegrate(cctx); err != nil {
+						klog.Errorf("assignSequenceAndIntegrate: %v", err)
+						break
+					} else if !more {
+						break
+					}
+					klog.Info("Quickloop")
 				}
 			}
 		}
 	}()
 
 	return r
+}
+
+func initDB(ctx context.Context, dbPool *sql.DB) error {
+	if _, err := dbPool.ExecContext(ctx,
+		`CREATE TABLE IF NOT EXISTS SeqCoord(
+			id INT UNSIGNED NOT NULL,
+			next BIGINT UNSIGNED NOT NULL,
+			PRIMARY KEY (id)
+		)`); err != nil {
+		return err
+	}
+	if _, err := dbPool.ExecContext(ctx,
+		`CREATE TABLE IF NOT EXISTS Seq(
+			id INT UNSIGNED NOT NULL,
+			seq BIGINT UNSIGNED NOT NULL,
+			v LONGBLOB,
+			PRIMARY KEY (id, seq)
+		)`); err != nil {
+		return err
+	}
+	if _, err := dbPool.ExecContext(ctx,
+		`CREATE TABLE IF NOT EXISTS IntCoord(
+			id INT UNSIGNED NOT NULL,
+			seq BIGINT UNSIGNED NOT NULL,
+			PRIMARY KEY (id)
+		)`); err != nil {
+		return err
+	}
+	if _, err := dbPool.ExecContext(ctx,
+		`INSERT IGNORE INTO IntCoord (id, seq) VALUES (0, 0)`); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (c *Storage) BucketExists(ctx context.Context, bucket string) (bool, error) {
@@ -299,27 +373,48 @@ func (s *Storage) Sequence(ctx context.Context, leaf []byte) (uint64, error) {
 	return s.pool.Add(leaf)
 }
 
-func (s *Storage) flushBatch(ctx context.Context, batch writer.Batch) error {
+func (s *Storage) flushBatch(ctx context.Context, batch writer.Batch) (uint64, error) {
 	b := &bytes.Buffer{}
 	e := gob.NewEncoder(b)
 	if err := e.Encode(batch); err != nil {
-		return fmt.Errorf("failed to serialise batch: %v", err)
+		return 0, fmt.Errorf("failed to serialise batch: %v", err)
 	}
 	data := b.Bytes()
-	start := rand.Intn(ringSize)
-	for i := 0; i < ringSize; i++ {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-		}
+	num := len(batch.Entries)
 
-		idx := (start + i) % ringSize
-		if err := s.writeIfNotExists(ctx, fmt.Sprintf(ringFormat, idx), data); err != nil {
-			continue
-		}
+	tx, err := s.dbPool.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("failed to begin tx: %v", err)
 	}
-	return errors.New("pushback - no slots free")
+	defer func() {
+		if tx != nil {
+			tx.Rollback()
+		}
+	}()
+
+	r := tx.QueryRowContext(ctx, "SELECT id, next FROM SeqCoord WHERE id = ? FOR UPDATE", 0)
+	var id, next uint64
+	if err := r.Scan(&id, &next); err == sql.ErrNoRows {
+		klog.Info("New log - first sequence")
+		if _, err := tx.ExecContext(ctx, "INSERT INTO SeqCoord (id, next) VALUES (?, ?)", 0, next+uint64(num)); err != nil {
+			return 0, fmt.Errorf("init new log in seqcoord: %v", err)
+		}
+	} else if err != nil {
+		return 0, fmt.Errorf("failed to read seqcoord: %v", err)
+	}
+	if _, err := tx.ExecContext(ctx, "INSERT INTO Seq(id, seq, v) VALUES(?, ?, ?)", 0, next, data); err != nil {
+		return 0, fmt.Errorf("insert into seq: %v", err)
+	}
+	if _, err := tx.ExecContext(ctx, "UPDATE SeqCoord SET next = ? WHERE ID = ?", next+uint64(num), 0); err != nil {
+		return 0, fmt.Errorf("update seqcoord: %v", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("commit: %v", err)
+	}
+	tx = nil
+
+	return next, nil
 }
 
 // sequenceBatch writes the entries from the provided batch into the entry bundle files of the log.
@@ -329,149 +424,122 @@ func (s *Storage) flushBatch(ctx context.Context, batch writer.Batch) error {
 // We try to minimise the number of partially complete entry bundles by writing entries in chunks rather
 // than one-by-one.
 func (s *Storage) sequenceBatch(ctx context.Context, batch writer.Batch) (uint64, error) {
-	if err := s.flushBatch(ctx, batch); err != nil {
-		return 0, err
-	}
-
-	// TODO: Wait for integration to complete.
-	// Read hash -> seq files, and return.
-	return 0, nil
+	return s.flushBatch(ctx, batch)
 }
 
-type ringInfo struct {
-	Pos int
-	Seq uint64
-}
-
-func (s *Storage) writeRingInfo(ctx context.Context, riGen int64, ri ringInfo) error {
-	b := &bytes.Buffer{}
-	if err := gob.NewEncoder(b).Encode(ri); err != nil {
-		return err
-	}
-	return s.writeIfGen(ctx, ringHeadPath, riGen, b.Bytes())
-}
-
-func (s *Storage) getRingInfo(ctx context.Context) (ringInfo, int64, error) {
-	riGob, riGen, err := s.GetObjectData(ctx, ringHeadPath)
-	if errors.Is(err, storage.ErrObjectNotExist) {
-		return ringInfo{}, 0, nil
-	} else if err != nil {
-		return ringInfo{}, -1, err
-	}
-	ri := ringInfo{}
-	if err := gob.NewDecoder(bytes.NewReader(riGob)).Decode(&ri); err != nil {
-		return ringInfo{}, -1, err
-	}
-	return ri, riGen, nil
-
-}
-
-func (s *Storage) assignSequenceAndIntegrate(ctx context.Context) error {
-	entries := [][]byte{}
-	curSize, _, _, err := s.currentTreeGen(ctx)
+func (s *Storage) assignSequenceAndIntegrate(ctx context.Context) (bool, error) {
+	tx, err := s.dbPool.BeginTx(ctx, nil)
 	if err != nil {
-		return fmt.Errorf("currentTreeGen: %v", err)
+		return false, err
 	}
-	s.curSize = curSize
+	defer func() {
+		if tx != nil {
+			tx.Rollback()
+		}
+	}()
+
+	row := tx.QueryRowContext(ctx, "SELECT seq FROM IntCoord WHERE id = ? FOR UPDATE", 0)
+	var fromSeq uint64
+	if err := row.Scan(&fromSeq); err == sql.ErrNoRows {
+		return false, nil
+	} else if err != nil {
+		return false, fmt.Errorf("failed to read coord info: %v", err)
+	}
+
+	s.curSize = fromSeq
 	now := time.Now()
 	numAdded := 0
 
 	klog.Infof("SA: Starting sequence & integrate...")
 	defer func() {
-		d := float64(time.Now().Sub(now) / time.Second)
+		d := float64(time.Now().Sub(now)) / float64(time.Second)
 		qps := 0.0
 		if d > 0 {
 			qps = float64(numAdded) / d
 		}
 		klog.Infof("SA: Sequencing & integrate @ %.1f qps took %vs", qps, d)
 	}()
-	deadline := time.Now().Add(1 * time.Second)
 
-	for time.Now().Before(deadline) {
-		ri, riGen, err := s.getRingInfo(ctx)
-		if err != nil {
-			return fmt.Errorf("getRingInfo: %v", err)
-		}
-		ringPath := fmt.Sprintf(ringFormat, ri.Pos)
-		klog.V(1).Infof("sequencing @%d qps from %s", ri.Seq, ringPath)
-		batchGob, batchGen, err := s.GetObjectData(ctx, ringPath)
-		if errors.Is(err, storage.ErrObjectNotExist) {
-			break
-			//return nil
-		} else if err != nil {
-			return fmt.Errorf("failed to read ring entry %d: %v", ri.Pos, err)
-		}
-
-		g := gob.NewDecoder(bytes.NewReader(batchGob))
-		batch := writer.Batch{}
-		if err := g.Decode(&batch); err != nil {
-			return fmt.Errorf("failed to deserialise batch: %v", err)
-		}
-
-		if len(batch.Entries) == 0 {
-			break
-			//return nil
-		}
-
-		bundleIndex, entriesInBundle := ri.Seq/uint64(s.entryBundleSize), ri.Seq%uint64(s.entryBundleSize)
-		bundle := &bytes.Buffer{}
-		if entriesInBundle > 0 {
-			// If the latest bundle is partial, we need to read the data it contains in for our newer, larger, bundle.
-			part, err := s.GetEntryBundle(ctx, bundleIndex, entriesInBundle)
-			if err != nil {
-				return err
-			}
-			bundle.Write(part)
-		}
-		// Add new entries to the bundle
-		// TODO: write out hash -> seq objects.
-		for _, e := range batch.Entries {
-			entries = append(entries, e)
-			bundle.WriteString(base64.StdEncoding.EncodeToString(e))
-			bundle.WriteString("\n")
-			entriesInBundle++
-			ri.Seq++
-			numAdded++
-			if entriesInBundle == uint64(s.entryBundleSize) {
-				//  This bundle is full, so we need to write it out...
-				klog.V(1).Infof("Bundle idx %x is full", bundleIndex)
-				objName := filepath.Join(layout.SeqPath("", bundleIndex))
-				if err := s.createExclusive(ctx, objName, bundle.Bytes()); err != nil {
-					if !errors.Is(os.ErrExist, err) {
-						return err
-					}
-				}
-				// ... and prepare the next entry bundle for any remaining entries in the batch
-				bundleIndex++
-				entriesInBundle = 0
-				bundle = &bytes.Buffer{}
-				klog.V(1).Infof("Starting bundle idx %d", bundleIndex)
-			}
-		}
-		// If we have a partial bundle remaining once we've added all the entries from the batch,
-		// this needs writing out too.
-		if entriesInBundle > 0 {
-			klog.V(1).Infof("Writing partial bundle idx %d.%d", bundleIndex, entriesInBundle)
-			bd, bf := layout.SeqPath("", bundleIndex)
-			bf = fmt.Sprintf("%s.%d", bf, entriesInBundle)
-			if err := s.createExclusive(ctx, filepath.Join(bd, bf), bundle.Bytes()); err != nil {
-				if !errors.Is(os.ErrExist, err) {
-					return err
-				}
-			}
-		}
-
-		ri.Pos = (ri.Pos + 1) % ringSize
-		if err := s.writeRingInfo(ctx, riGen, ri); err != nil {
-			return fmt.Errorf("writeRingInfo: %v", err)
-		}
-		if err := s.removeGen(ctx, ringPath, batchGen); err != nil {
-			return fmt.Errorf("removeGen(%s@%d): %v", ringPath, batchGen, err)
-		}
-
+	row = tx.QueryRowContext(ctx, "SELECT v FROM Seq WHERE id = ? AND seq = ? FOR UPDATE", 0, fromSeq)
+	var batchGob []byte
+	if err := row.Scan(&batchGob); err == sql.ErrNoRows {
+		return false, fmt.Errorf("integrity failure, Seq(%d/%d) not found", 0, fromSeq)
+	} else if err != nil {
+		return false, fmt.Errorf("failed to read seq(%d/%d): %v", 0, fromSeq, err)
 	}
-	klog.Infof("SA: Doing integrate... (after %vs)", time.Now().Sub(now))
-	return s.doIntegrate(ctx, curSize, entries)
+
+	g := gob.NewDecoder(bytes.NewReader(batchGob))
+	batch := writer.Batch{}
+	if err := g.Decode(&batch); err != nil {
+		return false, fmt.Errorf("failed to deserialise batch: %v", err)
+	}
+
+	if len(batch.Entries) == 0 {
+		return false, fmt.Errorf("no entries in batch seq %d", fromSeq)
+	}
+
+	seq := fromSeq
+	bundleIndex, entriesInBundle := seq/uint64(s.entryBundleSize), seq%uint64(s.entryBundleSize)
+	bundle := &bytes.Buffer{}
+	if entriesInBundle > 0 {
+		// If the latest bundle is partial, we need to read the data it contains in for our newer, larger, bundle.
+		part, err := s.GetEntryBundle(ctx, bundleIndex, entriesInBundle)
+		if err != nil {
+			return false, err
+		}
+		bundle.Write(part)
+	}
+	// Add new entries to the bundle
+	// TODO: write out hash -> seq objects.
+	for _, e := range batch.Entries {
+		bundle.WriteString(base64.StdEncoding.EncodeToString(e))
+		bundle.WriteString("\n")
+		entriesInBundle++
+		seq++
+		numAdded++
+		if entriesInBundle == uint64(s.entryBundleSize) {
+			//  This bundle is full, so we need to write it out...
+			klog.V(1).Infof("Bundle idx %x is full", bundleIndex)
+			objName := filepath.Join(layout.SeqPath("", bundleIndex))
+			if err := s.createExclusive(ctx, objName, bundle.Bytes()); err != nil {
+				if !errors.Is(os.ErrExist, err) {
+					return false, err
+				}
+			}
+			// ... and prepare the next entry bundle for any remaining entries in the batch
+			bundleIndex++
+			entriesInBundle = 0
+			bundle = &bytes.Buffer{}
+			klog.V(1).Infof("Starting bundle idx %d", bundleIndex)
+		}
+	}
+	// If we have a partial bundle remaining once we've added all the entries from the batch,
+	// this needs writing out too.
+	if entriesInBundle > 0 {
+		klog.V(1).Infof("Writing partial bundle idx %d.%d", bundleIndex, entriesInBundle)
+		bd, bf := layout.SeqPath("", bundleIndex)
+		bf = fmt.Sprintf("%s.%d", bf, entriesInBundle)
+		if err := s.createExclusive(ctx, filepath.Join(bd, bf), bundle.Bytes()); err != nil {
+			if !errors.Is(os.ErrExist, err) {
+				return false, err
+			}
+		}
+	}
+
+	if err := s.doIntegrate(ctx, fromSeq, batch.Entries); err != nil {
+		return false, fmt.Errorf("failed to integrate: %v", err)
+	}
+
+	if _, err := tx.ExecContext(ctx, "UPDATE IntCoord SET Seq=? WHERE ID=?", seq, 0); err != nil {
+		return false, fmt.Errorf("update intcoord: %v", err)
+	}
+	if _, err := tx.ExecContext(ctx, "DELETE FROM Seq WHERE Seq=? AND ID=?", fromSeq, 0); err != nil {
+		return false, fmt.Errorf("update intcoord: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf("commit: %v", err)
+	}
+	return true, nil
 }
 
 func (s *Storage) removeGen(ctx context.Context, gcsPath string, gen int64) error {

@@ -25,6 +25,7 @@ import (
 	"github.com/transparency-dev/serverless-log/api"
 	"github.com/transparency-dev/serverless-log/api/layout"
 	"github.com/transparency-dev/serverless-log/client"
+	"golang.org/x/sync/errgroup"
 	"k8s.io/klog/v2"
 )
 
@@ -110,10 +111,19 @@ func Integrate(ctx context.Context, fromSize uint64, batch [][]byte, st Integrat
 	// tiles and updated log state.
 	klog.V(1).Infof("New log state: size 0x%x hash: %x", baseRange.End(), newRoot)
 
+	eg := errgroup.Group{}
 	for k, t := range tc.m {
-		if err := st.StoreTile(ctx, k.level, k.index, t); err != nil {
-			return 0, nil, fmt.Errorf("failed to store tile at level %d index %d: %w", k.level, k.index, err)
-		}
+		k := k
+		t := t
+		eg.Go(func() error {
+			if err := st.StoreTile(ctx, k.level, k.index, t); err != nil {
+				return fmt.Errorf("failed to store tile at level %d index %d: %w", k.level, k.index, err)
+			}
+			return nil
+		})
+	}
+	if err := eg.Wait(); err != nil {
+		return 0, nil, err
 	}
 
 	return baseRange.End(), newRoot, nil

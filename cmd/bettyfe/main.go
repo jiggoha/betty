@@ -22,6 +22,10 @@ var (
 
 	project = flag.String("project", os.Getenv("GOOGLE_CLOUD_PROJECT"), "GCP Project, take from env if unset")
 	bucket  = flag.String("bucket", "", "Bucket to use for storing log")
+	dbConn  = flag.String("db_conn", "", "CloudSQL DB URL")
+	dbUser  = flag.String("db_user", "", "")
+	dbPass  = flag.String("db_pass", "", "")
+	dbName  = flag.String("db_name", "", "")
 
 	listen = flag.String("listen", ":2024", "Address:port to listen on")
 
@@ -91,6 +95,10 @@ func main() {
 		ProjectID:       *project,
 		Bucket:          *bucket,
 		EntryBundleSize: *bundleSize,
+		DBConn:          *dbConn,
+		DBUser:          *dbUser,
+		DBPass:          *dbPass,
+		DBName:          *dbName,
 	}
 	sKey, vKey := keysFromFlag()
 	gcsStorage := gcs.New(ctx, opts, *batchMaxSize, *batchMaxAge, vKey, sKey)
