@@ -36,6 +36,7 @@ import (
 	"github.com/transparency-dev/serverless-log/api"
 	"github.com/transparency-dev/serverless-log/api/layout"
 	"golang.org/x/mod/sumdb/note"
+	"golang.org/x/sync/errgroup"
 	"google.golang.org/api/googleapi"
 	"google.golang.org/api/iterator"
 	"k8s.io/klog/v2"
@@ -510,6 +511,8 @@ func (s *Storage) assignSequenceAndIntegrate(ctx context.Context) (bool, error) 
 		}
 		bundle.Write(part)
 	}
+
+	seqErr := errgroup.Group{}
 	// Add new entries to the bundle
 	// TODO: write out hash -> seq objects.
 	for _, e := range batch.Entries {
@@ -522,11 +525,15 @@ func (s *Storage) assignSequenceAndIntegrate(ctx context.Context) (bool, error) 
 			//  This bundle is full, so we need to write it out...
 			klog.V(1).Infof("Bundle idx %x is full", bundleIndex)
 			objName := filepath.Join(layout.SeqPath("", bundleIndex))
-			if err := s.createExclusive(ctx, objName, bundle.Bytes()); err != nil {
-				if !errors.Is(os.ErrExist, err) {
-					return false, err
+			b := bundle.Bytes()
+			seqErr.Go(func() error {
+				if err := s.createExclusive(ctx, objName, b); err != nil {
+					if !errors.Is(os.ErrExist, err) {
+						return err
+					}
 				}
-			}
+				return nil
+			})
 			// ... and prepare the next entry bundle for any remaining entries in the batch
 			bundleIndex++
 			entriesInBundle = 0
@@ -540,11 +547,18 @@ func (s *Storage) assignSequenceAndIntegrate(ctx context.Context) (bool, error) 
 		klog.V(1).Infof("Writing partial bundle idx %d.%d", bundleIndex, entriesInBundle)
 		bd, bf := layout.SeqPath("", bundleIndex)
 		bf = fmt.Sprintf("%s.%d", bf, entriesInBundle)
-		if err := s.createExclusive(ctx, filepath.Join(bd, bf), bundle.Bytes()); err != nil {
-			if !errors.Is(os.ErrExist, err) {
-				return false, err
+		seqErr.Go(func() error {
+			b := bundle.Bytes()
+			if err := s.createExclusive(ctx, filepath.Join(bd, bf), b); err != nil {
+				if !errors.Is(os.ErrExist, err) {
+					return err
+				}
 			}
-		}
+			return nil
+		})
+	}
+	if err := seqErr.Wait(); err != nil {
+		return false, err
 	}
 	sequenceDone = time.Now()
 
