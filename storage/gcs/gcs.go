@@ -27,6 +27,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -44,12 +45,6 @@ import (
 
 	gcs "cloud.google.com/go/storage"
 	f_log "github.com/transparency-dev/formats/log"
-)
-
-const (
-	ringSize     = 10
-	ringFormat   = "__seqRing/%04d"
-	ringHeadPath = "__seqRing/head"
 )
 
 // NewTreeFunc is the signature of a function which receives information about newly integrated trees.
@@ -92,6 +87,7 @@ type Storage struct {
 	otherCacheControl      string
 
 	entryBundleSize int
+	batchMaxSize    int
 
 	cpV note.Verifier
 	cpS note.Signer
@@ -160,6 +156,7 @@ func New(ctx context.Context, opts StorageOpts, batchMaxSize int, batchMaxAge ti
 		checkpointCacheControl: opts.CheckpointCacheControl,
 		otherCacheControl:      opts.OtherCacheControl,
 		entryBundleSize:        opts.EntryBundleSize,
+		batchMaxSize:           batchMaxSize,
 		cpV:                    cpV,
 		cpS:                    cpS,
 	}
@@ -448,6 +445,11 @@ func (s *Storage) assignSequenceAndIntegrate(ctx context.Context) (bool, error) 
 
 	s.curSize = fromSeq
 	now := time.Now()
+	readDone := time.Time{}
+	sequenceDone := time.Time{}
+	integrateDone := time.Time{}
+	sqlDone := time.Time{}
+
 	numAdded := 0
 
 	klog.Infof("SA: Starting sequence & integrate...")
@@ -457,26 +459,45 @@ func (s *Storage) assignSequenceAndIntegrate(ctx context.Context) (bool, error) 
 		if d > 0 {
 			qps = float64(numAdded) / d
 		}
-		klog.Infof("SA: Sequencing & integrate @ %.1f qps took %vs", qps, d)
+		f := func(s, e time.Time) string {
+			return fmt.Sprintf("%0.1f", float64(e.Sub(s))/float64(time.Second))
+		}
+		klog.Infof("SA: Sequencing & integrate: did %d @ %.1f qps took %0.1fs [r:%vs s:%vs i:%vs q:%vs]", numAdded, qps, d, f(now, readDone), f(readDone, sequenceDone), f(sequenceDone, integrateDone), f(integrateDone, sqlDone))
 	}()
 
-	row = tx.QueryRowContext(ctx, "SELECT v FROM Seq WHERE id = ? AND seq = ? FOR UPDATE", 0, fromSeq)
-	var batchGob []byte
-	if err := row.Scan(&batchGob); err == sql.ErrNoRows {
-		return false, fmt.Errorf("integrity failure, Seq(%d/%d) not found", 0, fromSeq)
-	} else if err != nil {
-		return false, fmt.Errorf("failed to read seq(%d/%d): %v", 0, fromSeq, err)
+	rows, err := tx.QueryContext(ctx, "SELECT seq, v FROM Seq WHERE id = ? AND seq >= ? ORDER BY SEQ LIMIT 10 FOR UPDATE", 0, fromSeq)
+	if err != nil {
+		return false, fmt.Errorf("failed to read Seq: %v", err)
 	}
+	defer rows.Close()
 
-	g := gob.NewDecoder(bytes.NewReader(batchGob))
+	seqsConsumed := []any{}
 	batch := writer.Batch{}
-	if err := g.Decode(&batch); err != nil {
-		return false, fmt.Errorf("failed to deserialise batch: %v", err)
-	}
 
-	if len(batch.Entries) == 0 {
-		return false, fmt.Errorf("no entries in batch seq %d", fromSeq)
+	orderCheck := fromSeq
+	for rows.Next() {
+		var batchGob []byte
+		var seq uint64
+		if err := rows.Scan(&seq, &batchGob); err != nil {
+			return false, fmt.Errorf("failed to scan seq row: %v", err)
+		}
+		seqsConsumed = append(seqsConsumed, seq)
+		if orderCheck != seq {
+			return false, fmt.Errorf("integrity fail - expected seq %d, but started at %d", orderCheck, seq)
+		}
+
+		g := gob.NewDecoder(bytes.NewReader(batchGob))
+		b := writer.Batch{}
+		if err := g.Decode(&b); err != nil {
+			return false, fmt.Errorf("failed to deserialise batch: %v", err)
+		}
+		batch.Entries = append(batch.Entries, b.Entries...)
+		orderCheck = seq + uint64(len(b.Entries))
 	}
+	if len(seqsConsumed) == 0 {
+		return false, nil
+	}
+	readDone = time.Now()
 
 	seq := fromSeq
 	bundleIndex, entriesInBundle := seq/uint64(s.entryBundleSize), seq%uint64(s.entryBundleSize)
@@ -525,21 +546,35 @@ func (s *Storage) assignSequenceAndIntegrate(ctx context.Context) (bool, error) 
 			}
 		}
 	}
+	sequenceDone = time.Now()
 
 	if err := s.doIntegrate(ctx, fromSeq, batch.Entries); err != nil {
 		return false, fmt.Errorf("failed to integrate: %v", err)
 	}
+	integrateDone = time.Now()
 
 	if _, err := tx.ExecContext(ctx, "UPDATE IntCoord SET Seq=? WHERE ID=?", seq, 0); err != nil {
 		return false, fmt.Errorf("update intcoord: %v", err)
 	}
-	if _, err := tx.ExecContext(ctx, "DELETE FROM Seq WHERE Seq=? AND ID=?", fromSeq, 0); err != nil {
+	q := "DELETE FROM Seq WHERE ID=? AND seq IN ( " + placeholder(len(seqsConsumed)) + " )"
+	if _, err := tx.ExecContext(ctx, q, append([]any{0}, seqsConsumed...)...); err != nil {
+		klog.Infof("Q: %s", q)
 		return false, fmt.Errorf("update intcoord: %v", err)
 	}
 	if err := tx.Commit(); err != nil {
 		return false, fmt.Errorf("commit: %v", err)
 	}
+	sqlDone = time.Now()
+	tx = nil
 	return true, nil
+}
+
+func placeholder(n int) string {
+	places := make([]string, n)
+	for i := 0; i < n; i++ {
+		places[i] = "?"
+	}
+	return strings.Join(places, ",")
 }
 
 func (s *Storage) removeGen(ctx context.Context, gcsPath string, gen int64) error {
