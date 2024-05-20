@@ -17,6 +17,7 @@ package gcs
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/base64"
 	"encoding/gob"
@@ -27,6 +28,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -309,6 +311,23 @@ func (s *Storage) readCheckpoint(ctx context.Context) ([]byte, int64, error) {
 	return cpRaw, mgen, err
 }
 
+func seqByHashPath(h []byte) string {
+	return fmt.Sprintf("internal/seqByHash/%064x", h)
+}
+
+// SequenceForLeafHash returns the sequence number associated with the provided leaf hash.
+// If no such leaf hash has (yet) been integrated into the log, os.ErrNotExist will be returned.
+func (s *Storage) SequenceForLeafHash(ctx context.Context, h []byte) (uint64, error) {
+	d, _, err := s.GetObjectData(ctx, seqByHashPath(h))
+	if err != nil {
+		if errors.Is(err, gcs.ErrObjectNotExist) {
+			return 0, os.ErrNotExist
+		}
+		return 0, err
+	}
+	return strconv.ParseUint(string(d), 10, 64)
+}
+
 // GetTile returns the tile at the given tile-level and tile-index.
 // If no complete tile exists at that location, it will attempt to find a
 // partial tile for the given tree size at that location.
@@ -514,7 +533,6 @@ func (s *Storage) assignSequenceAndIntegrate(ctx context.Context) (bool, error) 
 
 	seqErr := errgroup.Group{}
 	// Add new entries to the bundle
-	// TODO: write out hash -> seq objects.
 	for _, e := range batch.Entries {
 		bundle.WriteString(base64.StdEncoding.EncodeToString(e))
 		bundle.WriteString("\n")
@@ -531,6 +549,10 @@ func (s *Storage) assignSequenceAndIntegrate(ctx context.Context) (bool, error) 
 					if !errors.Is(os.ErrExist, err) {
 						return err
 					}
+					// TODO: this should be a passed-in leaf ID hash:
+					h := sha256.Sum256(b)
+					seqS := strconv.FormatUint(seq, 10)
+					return s.writeIfNotExists(ctx, seqByHashPath(h[:]), []byte(seqS))
 				}
 				return nil
 			})

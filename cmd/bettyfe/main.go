@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"flag"
 	"fmt"
 	"io"
@@ -40,6 +41,7 @@ type Storage interface {
 	// that index once it's durably committed.
 	// Implementations are expected to integrate these new entries in a "timely" fashion.
 	Sequence(context.Context, []byte) (uint64, error)
+	SequenceForLeafHash(context.Context, []byte) (uint64, error)
 	CurrentTree(context.Context) (uint64, []byte, error)
 	NewTree(context.Context, uint64, []byte) error
 }
@@ -130,11 +132,23 @@ func main() {
 			return
 		}
 		defer r.Body.Close()
-		idx, err := s.Sequence(ctx, b)
-		if err != nil {
+		
+		// TODO: this should be a leaf ID hash, and should be passed in to the storage too:
+		h := sha256.Sum256(b)
+
+		var idx uint64
+		if seq, err := s.SequenceForLeafHash(ctx, h[:]); err == os.ErrNotExist {
+			idx, err = s.Sequence(ctx, b)
+			if err != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				w.Write([]byte(fmt.Sprintf("Failed to sequence entry: %v", err)))
+				return
+			}
+		} else if err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
 			w.Write([]byte(fmt.Sprintf("Failed to sequence entry: %v", err)))
-			return
+		} else {
+			idx = seq
 		}
 		w.Write([]byte(fmt.Sprintf("%d\n", idx)))
 	})
