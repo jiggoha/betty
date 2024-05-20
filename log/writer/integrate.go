@@ -78,6 +78,27 @@ func (r *readCache) set(l, i uint64, t *api.Tile) {
 	r.entries[k] = t
 }
 
+func prewarmCache(nIDs []compact.NodeID, getTile func(l, i uint64) (*api.Tile, error)) error {
+	type li struct {
+		l, i uint64
+	}
+	// Ugh, fill cache:
+	tilesToFetch := make(map[li]bool)
+	for _, n := range nIDs {
+		tileLevel, tileIndex, _, _ := layout.NodeCoordsToTileAddress(uint64(n.Level), uint64(n.Index))
+		tilesToFetch[li{l: tileLevel, i: tileIndex}] = true
+	}
+	eg := errgroup.Group{}
+	for k := range tilesToFetch {
+		k := k
+		eg.Go(func() error {
+			_, err := getTile(k.l, k.i)
+			return err
+		})
+	}
+	return eg.Wait()
+}
+
 // Integrate adds all sequenced entries greater than fromSize into the tree.
 // Returns an updated Checkpoint, or an error.
 func Integrate(ctx context.Context, fromSize uint64, batch [][]byte, st IntegrateStorage, h merkle.LogHasher) (uint64, []byte, error) {
@@ -97,19 +118,7 @@ func Integrate(ctx context.Context, fromSize uint64, batch [][]byte, st Integrat
 		rc.set(l, i, t)
 		return t, nil
 	}
-
-	// Ugh, fill cache:
-	nIDs := compact.RangeNodes(0, fromSize, nil)
-	wg := sync.WaitGroup{}
-	for _, n := range nIDs {
-		wg.Add(1)
-		go func(n compact.NodeID) {
-			defer wg.Done()
-			tileLevel, tileIndex, _, _ := layout.NodeCoordsToTileAddress(uint64(n.Level), uint64(n.Index))
-			_, _ = getTile(tileLevel, tileIndex)
-		}(n)
-	}
-	wg.Done()
+	prewarmCache(compact.RangeNodes(0, fromSize, nil), getTile)
 
 	hashes, err := client.FetchRangeNodes(ctx, fromSize, func(_ context.Context, l, i uint64) (*api.Tile, error) {
 		return getTile(l, i)
