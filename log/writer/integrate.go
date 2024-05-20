@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sync"
 
 	"github.com/transparency-dev/merkle"
 	"github.com/transparency-dev/merkle/compact"
@@ -50,12 +51,65 @@ var (
 	ErrSeqAlreadyAssigned = errors.New("sequence number already assigned")
 )
 
+type readCache struct {
+	sync.RWMutex
+
+	hits    int
+	entries map[string]*api.Tile
+}
+
+func (r *readCache) get(l, i uint64) (*api.Tile, bool) {
+	r.RLock()
+	defer r.RUnlock()
+	e, ok := r.entries[fmt.Sprintf("%d/%d", l, i)]
+	if ok {
+		r.hits++
+	}
+	return e, ok
+}
+
+func (r *readCache) set(l, i uint64, t *api.Tile) {
+	r.Lock()
+	defer r.Unlock()
+	k := fmt.Sprintf("%d/%d", l, i)
+	if _, ok := r.entries[k]; ok {
+		panic(fmt.Errorf("Attempting to overwrite %v", k))
+	}
+	r.entries[k] = t
+}
+
 // Integrate adds all sequenced entries greater than fromSize into the tree.
 // Returns an updated Checkpoint, or an error.
 func Integrate(ctx context.Context, fromSize uint64, batch [][]byte, st IntegrateStorage, h merkle.LogHasher) (uint64, []byte, error) {
+	rc := readCache{entries: make(map[string]*api.Tile)}
+	defer func() {
+		klog.Infof("read cache hits: %d", rc.hits)
+	}()
 	getTile := func(l, i uint64) (*api.Tile, error) {
-		return st.GetTile(ctx, l, i, fromSize)
+		r, ok := rc.get(l, i)
+		if ok {
+			return r, nil
+		}
+		t, err := st.GetTile(ctx, l, i, fromSize)
+		if err != nil {
+			return nil, err
+		}
+		rc.set(l, i, t)
+		return t, nil
 	}
+
+	// Ugh, fill cache:
+	nIDs := compact.RangeNodes(0, fromSize, nil)
+	wg := sync.WaitGroup{}
+	for _, n := range nIDs {
+		wg.Add(1)
+		go func(n compact.NodeID) {
+			defer wg.Done()
+			tileLevel, tileIndex, _, _ := layout.NodeCoordsToTileAddress(uint64(n.Level), uint64(n.Index))
+			_, _ = getTile(tileLevel, tileIndex)
+		}(n)
+	}
+	wg.Done()
 
 	hashes, err := client.FetchRangeNodes(ctx, fromSize, func(_ context.Context, l, i uint64) (*api.Tile, error) {
 		return getTile(l, i)
