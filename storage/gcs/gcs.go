@@ -56,6 +56,9 @@ type NewTreeFunc func(size uint64, root []byte) error
 // CurrentTree is the signature of a function which retrieves the current integrated tree size and root hash.
 type CurrentTreeFunc func() (uint64, []byte, error)
 
+// ErrPushback is returned by Sequence() when there are too many "in-flight" requests to add entries to the log.
+var ErrPushback = errors.New("pushback: too many outstanding requests")
+
 // Storage is a serverless storage implementation which uses a GCS bucket to store tree state.
 // The naming of the objects of the GCS object is:
 //
@@ -95,7 +98,10 @@ type Storage struct {
 	cpV note.Verifier
 	cpS note.Signer
 
+	// curSize is the largest known integrated sequence number.
 	curSize uint64
+
+	pushBackLimit uint64
 }
 
 // StorageOpts holds configuration options for the storage client.
@@ -118,6 +124,11 @@ type StorageOpts struct {
 	// will be used.
 	OtherCacheControl string
 	EntryBundleSize   int
+
+	// PushBackLimit is a hint at the largest number of permissible sequenced-but-not-yet-integrated
+	// entries. The implementation will do a best-effort job to push-back on add requests once this
+	// limit is reached.
+	PushBackLimit uint64
 }
 
 // New returns a Client which allows interaction with the log stored in
@@ -160,6 +171,7 @@ func New(ctx context.Context, opts StorageOpts, batchMaxSize int, batchMaxAge ti
 		otherCacheControl:      opts.OtherCacheControl,
 		entryBundleSize:        opts.EntryBundleSize,
 		batchMaxSize:           batchMaxSize,
+		pushBackLimit:          opts.PushBackLimit,
 		cpV:                    cpV,
 		cpS:                    cpS,
 	}
@@ -419,6 +431,12 @@ func (s *Storage) flushBatch(ctx context.Context, batch writer.Batch) (uint64, e
 	} else if err != nil {
 		return 0, fmt.Errorf("failed to read seqcoord: %v", err)
 	}
+
+	if next-s.curSize > s.pushBackLimit {
+		klog.Infof("Pushback: %d-%d > %d", next, s.curSize, s.pushBackLimit)
+		return 0, ErrPushback
+	}
+
 	if _, err := tx.ExecContext(ctx, "INSERT INTO Seq(id, seq, v) VALUES(?, ?, ?)", 0, next, data); err != nil {
 		return 0, fmt.Errorf("insert into seq: %v", err)
 	}

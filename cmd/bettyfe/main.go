@@ -17,9 +17,10 @@ import (
 )
 
 var (
-	bundleSize   = flag.Int("bundle_size", 256, "Size of leaf bundle")
-	batchMaxSize = flag.Int("batch_max_size", 1024, "Size of batch before flushing")
-	batchMaxAge  = flag.Duration("batch_max_age", 100*time.Millisecond, "Max age for batch entries before flushing")
+	bundleSize    = flag.Int("bundle_size", 256, "Size of leaf bundle")
+	batchMaxSize  = flag.Int("batch_max_size", 1024, "Size of batch before flushing")
+	batchMaxAge   = flag.Duration("batch_max_age", 100*time.Millisecond, "Max age for batch entries before flushing")
+	pushBackLimit = flag.Uint64("pushback", 1000, "Number of inflight requests after which further additions will be refused")
 
 	project = flag.String("project", os.Getenv("GOOGLE_CLOUD_PROJECT"), "GCP Project, take from env if unset")
 	bucket  = flag.String("bucket", "", "Bucket to use for storing log")
@@ -97,6 +98,7 @@ func main() {
 		ProjectID:       *project,
 		Bucket:          *bucket,
 		EntryBundleSize: *bundleSize,
+		PushBackLimit:   *pushBackLimit,
 		DBConn:          *dbConn,
 		DBUser:          *dbUser,
 		DBPass:          *dbPass,
@@ -132,14 +134,18 @@ func main() {
 			return
 		}
 		defer r.Body.Close()
-		
+
 		// TODO: this should be a leaf ID hash, and should be passed in to the storage too:
 		h := sha256.Sum256(b)
 
 		var idx uint64
 		if seq, err := s.SequenceForLeafHash(ctx, h[:]); err == os.ErrNotExist {
 			idx, err = s.Sequence(ctx, b)
-			if err != nil {
+			if err == gcs.ErrPushback {
+				w.WriteHeader(http.StatusTooManyRequests)
+				w.Write([]byte(fmt.Sprintf("Back off: %v", err)))
+				return
+			} else if err != nil {
 				w.WriteHeader(http.StatusInternalServerError)
 				w.Write([]byte(fmt.Sprintf("Failed to sequence entry: %v", err)))
 				return
