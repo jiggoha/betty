@@ -43,8 +43,8 @@ import (
 	"google.golang.org/api/iterator"
 	"k8s.io/klog/v2"
 
-	"cloud.google.com/go/cloudsqlconn"
-	"github.com/go-sql-driver/mysql"
+	"cloud.google.com/go/alloydbconn"
+	"github.com/jackc/pgx/v4/pgxpool"
 
 	gcs "cloud.google.com/go/storage"
 	f_log "github.com/transparency-dev/formats/log"
@@ -76,7 +76,7 @@ type Storage struct {
 	// bucket is the name of the bucket where tree data will be stored.
 	bucket string
 
-	dbPool *sql.DB
+	dbPool *pgxpool.Pool
 
 	// nextSeq is a hint to the Sequence func as to what the next available
 	// sequence number is to help performance.
@@ -139,21 +139,29 @@ func New(ctx context.Context, opts StorageOpts, batchMaxSize int, batchMaxAge ti
 		klog.Exitf("Failed to create GCS storage: %v", err)
 	}
 
-	d, err := cloudsqlconn.NewDialer(context.Background())
+	// Configure the driver to connect to the database
+	dsn := fmt.Sprintf("user=%s password=%s dbname=%s sslmode=disable", opts.DBUser, opts.DBPass, opts.DBName)
+	config, err := pgxpool.ParseConfig(dsn)
 	if err != nil {
-		klog.Exitf("cloudsqlconn.NewDialer: %v", err)
+		klog.Fatalf("failed to parse pgx config: %v", err)
 	}
-	mysql.RegisterDialContext("cloudsqlconn",
-		func(ctx context.Context, addr string) (net.Conn, error) {
-			return d.Dial(ctx, opts.DBConn)
-		})
 
-	dbURI := fmt.Sprintf("%s:%s@cloudsqlconn(localhost:3306)/%s?parseTime=true",
-		opts.DBUser, opts.DBPass, opts.DBName)
-
-	dbPool, err := sql.Open("mysql", dbURI)
+	// Create a new dialer with any options
+	// TODO: return a closer to main
+	d, err := alloydbconn.NewDialer(ctx)
 	if err != nil {
-		klog.Exitf("Failed to open CloudSQL: %v", err)
+		klog.Fatalf("failed to initialize dialer: %v", err)
+	}
+
+	// Tell the driver to use the AlloyDB Go Connector to create connections
+	config.ConnConfig.DialFunc = func(ctx context.Context, _ string, instance string) (net.Conn, error) {
+		return d.Dial(ctx, opts.DBConn)
+	}
+
+	// Interact with the driver directly as you normally would
+	dbPool, err := pgxpool.ConnectConfig(context.Background(), config)
+	if err != nil {
+		klog.Fatalf("failed to connect: %v", err)
 	}
 
 	if err := initDB(ctx, dbPool); err != nil {
@@ -202,34 +210,38 @@ func New(ctx context.Context, opts StorageOpts, batchMaxSize int, batchMaxAge ti
 	return r
 }
 
-func initDB(ctx context.Context, dbPool *sql.DB) error {
-	if _, err := dbPool.ExecContext(ctx,
+func initDB(ctx context.Context, dbPool *pgxpool.Pool) error {
+	if _, err := dbPool.Exec(ctx,
 		`CREATE TABLE IF NOT EXISTS SeqCoord(
-			id INT UNSIGNED NOT NULL,
-			next BIGINT UNSIGNED NOT NULL,
-			PRIMARY KEY (id)
+			id INTEGER NOT NULL,
+			next BIGINT NOT NULL,
+			PRIMARY KEY(id)
 		)`); err != nil {
 		return err
 	}
-	if _, err := dbPool.ExecContext(ctx,
+	if _, err := dbPool.Exec(ctx,
 		`CREATE TABLE IF NOT EXISTS Seq(
-			id INT UNSIGNED NOT NULL,
-			seq BIGINT UNSIGNED NOT NULL,
-			v LONGBLOB,
-			PRIMARY KEY (id, seq)
+			id INTEGER NOT NULL,
+			seq BIGINT NOT NULL,
+			v BYTEA,
+			CONSTRAINT id_seq PRIMARY KEY (id, seq)
 		)`); err != nil {
 		return err
 	}
-	if _, err := dbPool.ExecContext(ctx,
+	if _, err := dbPool.Exec(ctx,
 		`CREATE TABLE IF NOT EXISTS IntCoord(
-			id INT UNSIGNED NOT NULL,
-			seq BIGINT UNSIGNED NOT NULL,
-			PRIMARY KEY (id)
+			id INTEGER NOT NULL,
+			seq BIGINT NOT NULL,
+			PRIMARY KEY(id)
 		)`); err != nil {
 		return err
 	}
-	if _, err := dbPool.ExecContext(ctx,
-		`INSERT IGNORE INTO IntCoord (id, seq) VALUES (0, 0)`); err != nil {
+	if _, err := dbPool.Exec(ctx,
+		`INSERT INTO SeqCoord (id, next) VALUES (0, 0) ON CONFLICT DO NOTHING`); err != nil {
+		return err
+	}
+	if _, err := dbPool.Exec(ctx,
+		`INSERT INTO IntCoord (id, seq) VALUES (0, 0) ON CONFLICT DO NOTHING`); err != nil {
 		return err
 	}
 	return nil
@@ -411,21 +423,21 @@ func (s *Storage) flushBatch(ctx context.Context, batch writer.Batch) (uint64, e
 	data := b.Bytes()
 	num := len(batch.Entries)
 
-	tx, err := s.dbPool.BeginTx(ctx, nil)
+	tx, err := s.dbPool.Begin(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("failed to begin tx: %v", err)
 	}
 	defer func() {
 		if tx != nil {
-			tx.Rollback()
+			tx.Rollback(ctx)
 		}
 	}()
 
-	r := tx.QueryRowContext(ctx, "SELECT id, next FROM SeqCoord WHERE id = ? FOR UPDATE", 0)
+	r := tx.QueryRow(ctx, "SELECT id, next FROM SeqCoord WHERE id = $1 FOR UPDATE", 0)
 	var id, next uint64
 	if err := r.Scan(&id, &next); err == sql.ErrNoRows {
 		klog.Info("New log - first sequence")
-		if _, err := tx.ExecContext(ctx, "INSERT INTO SeqCoord (id, next) VALUES (?, ?)", 0, next+uint64(num)); err != nil {
+		if _, err := tx.Exec(ctx, "INSERT INTO SeqCoord (id, next) VALUES ($1, $2)", 0, next+uint64(num)); err != nil {
 			return 0, fmt.Errorf("init new log in seqcoord: %v", err)
 		}
 	} else if err != nil {
@@ -437,14 +449,14 @@ func (s *Storage) flushBatch(ctx context.Context, batch writer.Batch) (uint64, e
 		return 0, ErrPushback
 	}
 
-	if _, err := tx.ExecContext(ctx, "INSERT INTO Seq(id, seq, v) VALUES(?, ?, ?)", 0, next, data); err != nil {
+	if _, err := tx.Exec(ctx, "INSERT INTO Seq(id, seq, v) VALUES($1, $2, $3)", 0, next, data); err != nil {
 		return 0, fmt.Errorf("insert into seq: %v", err)
 	}
-	if _, err := tx.ExecContext(ctx, "UPDATE SeqCoord SET next = ? WHERE ID = ?", next+uint64(num), 0); err != nil {
+	if _, err := tx.Exec(ctx, "UPDATE SeqCoord SET next = $1 WHERE ID = $2", next+uint64(num), 0); err != nil {
 		return 0, fmt.Errorf("update seqcoord: %v", err)
 	}
 
-	if err := tx.Commit(); err != nil {
+	if err := tx.Commit(ctx); err != nil {
 		return 0, fmt.Errorf("commit: %v", err)
 	}
 	tx = nil
@@ -463,17 +475,17 @@ func (s *Storage) sequenceBatch(ctx context.Context, batch writer.Batch) (uint64
 }
 
 func (s *Storage) assignSequenceAndIntegrate(ctx context.Context) (bool, error) {
-	tx, err := s.dbPool.BeginTx(ctx, nil)
+	tx, err := s.dbPool.Begin(ctx)
 	if err != nil {
 		return false, err
 	}
 	defer func() {
 		if tx != nil {
-			tx.Rollback()
+			tx.Rollback(ctx)
 		}
 	}()
 
-	row := tx.QueryRowContext(ctx, "SELECT seq FROM IntCoord WHERE id = ? FOR UPDATE", 0)
+	row := tx.QueryRow(ctx, "SELECT seq FROM IntCoord WHERE id = $1 FOR UPDATE", 0)
 	var fromSeq uint64
 	if err := row.Scan(&fromSeq); err == sql.ErrNoRows {
 		return false, nil
@@ -503,7 +515,7 @@ func (s *Storage) assignSequenceAndIntegrate(ctx context.Context) (bool, error) 
 		klog.Infof("SA: Sequencing & integrate: did %d @ %.1f qps took %0.1fs [r:%vs s:%vs i:%vs q:%vs]", numAdded, qps, d, f(now, readDone), f(readDone, sequenceDone), f(sequenceDone, integrateDone), f(integrateDone, sqlDone))
 	}()
 
-	rows, err := tx.QueryContext(ctx, "SELECT seq, v FROM Seq WHERE id = ? AND seq >= ? ORDER BY SEQ LIMIT 10 FOR UPDATE", 0, fromSeq)
+	rows, err := tx.Query(ctx, "SELECT seq, v FROM Seq WHERE id = $1 AND seq >= $2 ORDER BY SEQ LIMIT 10 FOR UPDATE", 0, fromSeq)
 	if err != nil {
 		return false, fmt.Errorf("failed to read Seq: %v", err)
 	}
@@ -607,15 +619,15 @@ func (s *Storage) assignSequenceAndIntegrate(ctx context.Context) (bool, error) 
 	}
 	integrateDone = time.Now()
 
-	if _, err := tx.ExecContext(ctx, "UPDATE IntCoord SET Seq=? WHERE ID=?", seq, 0); err != nil {
+	if _, err := tx.Exec(ctx, "UPDATE IntCoord SET Seq=$1 WHERE ID=$2", seq, 0); err != nil {
 		return false, fmt.Errorf("update intcoord: %v", err)
 	}
-	q := "DELETE FROM Seq WHERE ID=? AND seq IN ( " + placeholder(len(seqsConsumed)) + " )"
-	if _, err := tx.ExecContext(ctx, q, append([]any{0}, seqsConsumed...)...); err != nil {
+	q := "DELETE FROM Seq WHERE ID=$1 AND seq IN ( " + placeholder(len(seqsConsumed), 2) + " )"
+	if _, err := tx.Exec(ctx, q, append([]any{0}, seqsConsumed...)...); err != nil {
 		klog.Infof("Q: %s", q)
 		return false, fmt.Errorf("update intcoord: %v", err)
 	}
-	if err := tx.Commit(); err != nil {
+	if err := tx.Commit(ctx); err != nil {
 		return false, fmt.Errorf("commit: %v", err)
 	}
 	sqlDone = time.Now()
@@ -623,10 +635,10 @@ func (s *Storage) assignSequenceAndIntegrate(ctx context.Context) (bool, error) 
 	return true, nil
 }
 
-func placeholder(n int) string {
+func placeholder(n, start int) string {
 	places := make([]string, n)
 	for i := 0; i < n; i++ {
-		places[i] = "?"
+		places[i] = fmt.Sprintf("$%d", start+i)
 	}
 	return strings.Join(places, ",")
 }
