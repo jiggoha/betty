@@ -4,10 +4,12 @@ import (
 	"context"
 	"sync"
 	"time"
+
+	"github.com/AlCutter/betty"
 )
 
 type Batch struct {
-	Entries [][]byte
+	Entries []betty.Entry
 }
 
 // SequenceFunc knows how to assign contiguous sequence numbers to the entries in Batch.
@@ -39,7 +41,7 @@ type Pool struct {
 
 // Add adds an entry to the tree.
 // Returns the assigned sequence number, or an error.
-func (p *Pool) Add(e []byte) (uint64, error) {
+func (p *Pool) Add(e betty.Entry) (uint64, error) {
 	p.Lock()
 	b := p.current
 	// If this is the first entry in a batch, set a flush timer so we attempt to sequence it within maxAge.
@@ -79,13 +81,13 @@ func (p *Pool) flushWithLock() {
 }
 
 type batch struct {
-	Entries  [][]byte
+	Entries  []betty.Entry
 	Done     chan struct{}
 	FirstSeq uint64
 	Err      error
 }
 
-func (b *batch) Add(e []byte) int {
+func (b *batch) Add(e betty.Entry) int {
 	b.Entries = append(b.Entries, e)
 	return len(b.Entries)
 }
