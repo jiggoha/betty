@@ -17,7 +17,6 @@ package gcs
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
 	"database/sql"
 	"encoding/base64"
 	"encoding/gob"
@@ -33,6 +32,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/AlCutter/betty"
 	"github.com/AlCutter/betty/log/writer"
 	"github.com/transparency-dev/merkle/rfc6962"
 	"github.com/transparency-dev/serverless-log/api"
@@ -287,7 +287,7 @@ func (s *Storage) create(ctx context.Context, bucket string) error {
 // generation that the client thinks the checkpoint is. The client updates the
 // generation number of the checkpoint whenever ReadCheckpoint is called.
 //
-// This method will fail to write if 1) the checkpoint exists and the client
+// This method will fail to write if 1) the checkpo1Gint exists and the client
 // has never read it or 2) the checkpoint has been updated since the client
 // called ReadCheckpoint.
 func (s *Storage) writeCheckpoint(ctx context.Context, newCPRaw []byte) error {
@@ -335,6 +335,12 @@ func (s *Storage) SequenceForLeafHash(ctx context.Context, h []byte) (uint64, er
 		return 0, err
 	}
 	return strconv.ParseUint(string(d), 10, 64)
+}
+
+// StoreSequenceForLeafHash updates the leafhash->seq index for squashing dupes.
+func (s *Storage) StoreSequenceForLeafHash(ctx context.Context, leafHash []byte, seq uint64) error {
+	seqS := strconv.FormatUint(seq, 10)
+	return s.writeIfNotExists(ctx, seqByHashPath(leafHash), []byte(seqS))
 }
 
 // GetTile returns the tile at the given tile-level and tile-index.
@@ -395,7 +401,7 @@ func (s *Storage) GetObjectData(ctx context.Context, obj string) ([]byte, int64,
 
 // Sequence commits to sequence numbers for an entry
 // Returns the sequence number assigned to the first entry in the batch, or an error.
-func (s *Storage) Sequence(ctx context.Context, leaf []byte) (uint64, error) {
+func (s *Storage) Sequence(ctx context.Context, leaf betty.Entry) (uint64, error) {
 	return s.pool.Add(leaf)
 }
 
@@ -549,7 +555,7 @@ func (s *Storage) assignSequenceAndIntegrate(ctx context.Context) (bool, error) 
 	seqErr := errgroup.Group{}
 	// Add new entries to the bundle
 	for _, e := range batch.Entries {
-		bundle.WriteString(base64.StdEncoding.EncodeToString(e))
+		bundle.WriteString(base64.StdEncoding.EncodeToString(e.Data))
 		bundle.WriteString("\n")
 		entriesInBundle++
 		seq++
@@ -564,10 +570,6 @@ func (s *Storage) assignSequenceAndIntegrate(ctx context.Context) (bool, error) 
 					if !errors.Is(os.ErrExist, err) {
 						return err
 					}
-					// TODO: this should be a passed-in leaf ID hash:
-					h := sha256.Sum256(b)
-					seqS := strconv.FormatUint(seq, 10)
-					return s.writeIfNotExists(ctx, seqByHashPath(h[:]), []byte(seqS))
 				}
 				return nil
 			})
@@ -599,7 +601,12 @@ func (s *Storage) assignSequenceAndIntegrate(ctx context.Context) (bool, error) 
 	}
 	sequenceDone = time.Now()
 
-	if err := s.doIntegrate(ctx, fromSeq, batch.Entries); err != nil {
+	leafHashes := make([][]byte, 0, len(batch.Entries))
+	for _, e := range batch.Entries {
+		leafHashes = append(leafHashes, e.MerkleHash)
+	}
+
+	if err := s.doIntegrate(ctx, fromSeq, leafHashes); err != nil {
 		return false, fmt.Errorf("failed to integrate: %v", err)
 	}
 	integrateDone = time.Now()
