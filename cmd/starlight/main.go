@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/AlCutter/betty"
 	"github.com/AlCutter/betty/storage/gcs"
 	"golang.org/x/mod/sumdb/note"
 	"k8s.io/klog/v2"
@@ -36,17 +37,6 @@ var (
 )
 
 // Storage defines the explicit interface that storage implementations must implement for the HTTP handler here.
-// In addition, they'll need to implement the IntegrateStorage methods in log/writer/integrate.go too.
-type Storage interface {
-	// Sequence assigns the provided leaf data to an index in the log, returning
-	// that index once it's durably committed.
-	// Implementations are expected to integrate these new entries in a "timely" fashion.
-	Sequence(context.Context, []byte) (uint64, error)
-	SequenceForLeafHash(context.Context, []byte) (uint64, error)
-	CurrentTree(context.Context) (uint64, []byte, error)
-	NewTree(context.Context, uint64, []byte) error
-}
-
 type latency struct {
 	sync.Mutex
 	total time.Duration
@@ -105,16 +95,17 @@ func main() {
 		DBName:          *dbName,
 	}
 	sKey, vKey := keysFromFlag()
-	gcsStorage := gcs.New(ctx, opts, *batchMaxSize, *batchMaxAge, vKey, sKey)
+	/*
+		logStorage, sequenceWriter := betty.NewSequencingWriter(ctx,
+			gcs.New(ctx, opts, *batchMaxSize, *batchMaxAge, vKey, sKey),
+			betty.WithDedup,
+			betty.WithSynchronousIntegration,
+		)
+	*/
 
-	var s Storage = gcsStorage
+	storage := gcs.New(ctx, opts, *batchMaxSize, *batchMaxAge, vKey, sKey)
+	logStorage, sequenceWriter := betty.WithSynchronousIntegration(betty.WithDedup(storage, storage.Sequence))
 
-	if _, _, err := s.CurrentTree(ctx); err != nil {
-		klog.Infof("ct: %v", err)
-		if err := s.NewTree(ctx, 0, []byte("Empty")); err != nil {
-			klog.Exitf("Failed to initialise log: %v", err)
-		}
-	}
 	l := &latency{}
 
 	http.HandleFunc("POST /add", func(w http.ResponseWriter, r *http.Request) {
@@ -131,40 +122,33 @@ func main() {
 		// TODO: this should be a leaf ID hash, and should be passed in to the storage too:
 		h := sha256.Sum256(b)
 
-		var idx uint64
-		if seq, err := s.SequenceForLeafHash(ctx, h[:]); err == os.ErrNotExist {
-			idx, err = s.Sequence(ctx, b)
-			if err == gcs.ErrPushback {
-				w.WriteHeader(http.StatusTooManyRequests)
-				w.Write([]byte(fmt.Sprintf("Back off: %v", err)))
-				return
-			} else if err != nil {
-				w.WriteHeader(http.StatusInternalServerError)
-				w.Write([]byte(fmt.Sprintf("Failed to sequence entry: %v", err)))
-				return
-			}
+		idx, err := sequenceWriter(ctx, betty.Entry{Data: b, Identity: h[:]})
+		if err == gcs.ErrPushback {
+			w.WriteHeader(http.StatusTooManyRequests)
+			w.Write([]byte(fmt.Sprintf("Back off: %v", err)))
+			return
 		} else if err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
 			w.Write([]byte(fmt.Sprintf("Failed to sequence entry: %v", err)))
-		} else {
-			idx = seq
+			return
 		}
 		w.Write([]byte(fmt.Sprintf("%d\n", idx)))
 	})
 
-	http.HandleFunc("/", func(resp http.ResponseWriter, req *http.Request) {
-		p := req.URL.Path[1:] // strip off leading slash
-		klog.V(4).Infof("HTTP: %v", p)
-		b, _, err := gcsStorage.GetObjectData(ctx, p)
-		if err != nil {
-			klog.V(4).Infof("HTTP: %v: %v", p, err)
-			resp.WriteHeader(http.StatusBadRequest)
-			return
-		}
-		resp.Write(b)
-	})
-
-	go printStats(ctx, s.CurrentTree, l)
+	/*
+		http.HandleFunc("/", func(resp http.ResponseWriter, req *http.Request) {
+			p := req.URL.Path[1:] // strip off leading slash
+			klog.V(4).Infof("HTTP: %v", p)
+			b, _, err := gcsStorage.GetObjectData(ctx, p)
+			if err != nil {
+				klog.V(4).Infof("HTTP: %v: %v", p, err)
+				resp.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			resp.Write(b)
+		})
+	*/
+	go printStats(ctx, logStorage.CurrentTree, l)
 	if err := http.ListenAndServe(*listen, http.DefaultServeMux); err != nil {
 		klog.Exitf("ListenAndServe: %v", err)
 	}
