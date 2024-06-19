@@ -121,8 +121,10 @@ func main() {
 
 		// TODO: this should be a leaf ID hash, and should be passed in to the storage too:
 		h := sha256.Sum256(b)
+		e := betty.NewEntryWithIdentity(b, h[:])
+		betty.BadPractice.SetLeafHash(&e, h[:])
 
-		idx, err := sequenceWriter(ctx, betty.Entry{Data: b, Identity: h[:]})
+		idx, err := sequenceWriter(ctx, e)
 		if err == gcs.ErrPushback {
 			w.WriteHeader(http.StatusTooManyRequests)
 			w.Write([]byte(fmt.Sprintf("Back off: %v", err)))
