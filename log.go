@@ -35,23 +35,6 @@ func NewEntryWithIdentity(data []byte, identity []byte) Entry {
 	return e
 }
 
-// BadPractice exports functions which are generally considered bad practice.
-// These functions are only provided for backwards compatibility with legacy systems,
-// modern transparency ecosystems should not use them.
-var BadPractice *badPractice
-
-type badPractice struct{}
-
-// SetLeafHash overrides an entry's MerkleLeafHash.
-//
-// Normally, this should be calculated automatically and commit to the entirety of the
-// leaf data. Overriding this can result in anything from a tree with entries which
-// cannot shown to have been included, to broken security properties due to malleable
-// entries.
-func (bp badPractice) SetLeafHash(e *Entry, leafHash []byte) {
-	e.leafHash = leafHash
-}
-
 // SequenceWriter takes a Entry, assigns it to an index in the log, and returns the assigned index.
 // If the entry's Identity has previously been assigned an index, the storage MAY return a previous index.
 // Implementations MAY integrate the entry into the log before returning, but SHOULD target integrating entries
