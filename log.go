@@ -12,9 +12,44 @@ import (
 
 // Entry represents an entry in a log.
 type Entry struct {
-	Data       []byte
-	MerkleHash []byte
-	Identity   []byte
+	data     []byte
+	identity []byte
+	leafHash []byte
+}
+
+func (e Entry) Data() []byte     { return e.data }
+func (e Entry) Identity() []byte { return e.identity }
+func (e Entry) LeafHash() []byte { return e.leafHash }
+
+// NewEntry creates a new Entry object with leaf data.
+func NewEntry(data []byte) Entry {
+	return Entry{
+		data: data,
+	}
+}
+
+// NewEntryWithIdentity creates a new Entry with leaf data and a semantic identity.
+func NewEntryWithIdentity(data []byte, identity []byte) Entry {
+	e := NewEntry(data)
+	e.identity = identity
+	return e
+}
+
+// BadPractice exports functions which are generally considered bad practice.
+// These functions are only provided for backwards compatibility with legacy systems,
+// modern transparency ecosystems should not use them.
+var BadPractice *badPractice
+
+type badPractice struct{}
+
+// SetLeafHash overrides an entry's MerkleLeafHash.
+//
+// Normally, this should be calculated automatically and commit to the entirety of the
+// leaf data. Overriding this can result in anything from a tree with entries which
+// cannot shown to have been included, to broken security properties due to malleable
+// entries.
+func (bp badPractice) SetLeafHash(e *Entry, leafHash []byte) {
+	e.leafHash = leafHash
 }
 
 // SequenceWriter takes a Entry, assigns it to an index in the log, and returns the assigned index.
@@ -35,7 +70,7 @@ type Storage interface {
 func NewSequencingWriter[T Storage](ctx context.Context, s T, opts ...WriterOpts[T]) (*Log, SequenceWriter) {
 	// Use a safe algorithm for calulating Merkle leaf hashes.
 	seq := func(ctx context.Context, entry Entry) (uint64, error) {
-		entry.MerkleHash = rfc6962.DefaultHasher.HashLeaf(entry.Data)
+		entry.leafHash = rfc6962.DefaultHasher.HashLeaf(entry.data)
 		return s.Sequence(ctx, entry)
 	}
 	// Apply all the options
@@ -60,7 +95,7 @@ type DedupStorage interface {
 // In order to use this option, the underlying storage must also implement the DedupStorage interface.
 func WithDedup[T DedupStorage](s T, seq SequenceWriter) (T, SequenceWriter) {
 	seq = func(ctx context.Context, e Entry) (uint64, error) {
-		if seq, err := s.SequenceForLeafHash(ctx, e.Identity); err != nil {
+		if seq, err := s.SequenceForLeafHash(ctx, e.Identity()); err != nil {
 			if err != os.ErrNotExist {
 				return 0, fmt.Errorf("failed to dedupe: %v", err)
 			}
@@ -71,7 +106,7 @@ func WithDedup[T DedupStorage](s T, seq SequenceWriter) (T, SequenceWriter) {
 		if err != nil {
 			return 0, err
 		}
-		if err := s.StoreSequenceForLeafHash(ctx, e.Identity, seq); err != nil {
+		if err := s.StoreSequenceForLeafHash(ctx, e.Identity(), seq); err != nil {
 			return 0, fmt.Errorf("failed to store dedupe info: %v", err)
 		}
 		return seq, nil

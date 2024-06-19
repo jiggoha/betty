@@ -555,7 +555,7 @@ func (s *Storage) assignSequenceAndIntegrate(ctx context.Context) (bool, error) 
 	seqErr := errgroup.Group{}
 	// Add new entries to the bundle
 	for _, e := range batch.Entries {
-		bundle.WriteString(base64.StdEncoding.EncodeToString(e.Data))
+		bundle.WriteString(base64.StdEncoding.EncodeToString(e.Data()))
 		bundle.WriteString("\n")
 		entriesInBundle++
 		seq++
@@ -603,7 +603,7 @@ func (s *Storage) assignSequenceAndIntegrate(ctx context.Context) (bool, error) 
 
 	leafHashes := make([][]byte, 0, len(batch.Entries))
 	for _, e := range batch.Entries {
-		leafHashes = append(leafHashes, e.MerkleHash)
+		leafHashes = append(leafHashes, e.LeafHash())
 	}
 
 	if err := s.doIntegrate(ctx, fromSeq, leafHashes); err != nil {
