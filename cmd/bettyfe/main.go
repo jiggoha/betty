@@ -11,7 +11,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/AlCutter/betty/storage/gcs"
+	"github.com/AlCutter/betty/storage/aurora"
 	"golang.org/x/mod/sumdb/note"
 	"k8s.io/klog/v2"
 )
@@ -94,7 +94,7 @@ func main() {
 	flag.Parse()
 	ctx := context.Background()
 
-	opts := gcs.StorageOpts{
+	opts := aurora.StorageOpts{
 		ProjectID:       *project,
 		Bucket:          *bucket,
 		EntryBundleSize: *bundleSize,
@@ -105,7 +105,7 @@ func main() {
 		DBName:          *dbName,
 	}
 	sKey, vKey := keysFromFlag()
-	gcsStorage := gcs.New(ctx, opts, *batchMaxSize, *batchMaxAge, vKey, sKey)
+	gcsStorage := aurora.New(ctx, opts, *batchMaxSize, *batchMaxAge, vKey, sKey)
 
 	var s Storage = gcsStorage
 
@@ -134,7 +134,7 @@ func main() {
 		var idx uint64
 		if seq, err := s.SequenceForLeafHash(ctx, h[:]); err == os.ErrNotExist {
 			idx, err = s.Sequence(ctx, b)
-			if err == gcs.ErrPushback {
+			if err == aurora.ErrPushback {
 				w.WriteHeader(http.StatusTooManyRequests)
 				w.Write([]byte(fmt.Sprintf("Back off: %v", err)))
 				return
