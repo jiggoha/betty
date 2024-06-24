@@ -159,7 +159,7 @@ func New(ctx context.Context, opts StorageOpts, batchMaxSize int, batchMaxAge ti
 	//	panic("failed to create authentication token: " + err.Error())
 	//}
 
-	dsn := fmt.Sprintf("%s:%s@tcp(%s)/%s?tls=true&allowCleartextPasswords=true",
+	dsn := fmt.Sprintf("%s:%s@tcp(%s)/%s?allowCleartextPasswords=true",
 		dbUser, "password", dbEndpoint, dbName,
 	)
 
