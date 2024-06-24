@@ -45,7 +45,6 @@ import (
 	"golang.org/x/sync/errgroup"
 	"k8s.io/klog/v2"
 
-	gcs "cloud.google.com/go/storage"
 	f_log "github.com/transparency-dev/formats/log"
 )
 
@@ -331,7 +330,8 @@ func seqByHashPath(h []byte) string {
 func (s *Storage) SequenceForLeafHash(ctx context.Context, h []byte) (uint64, error) {
 	d, err := s.GetObjectData(ctx, seqByHashPath(h))
 	if err != nil {
-		if errors.Is(err, gcs.ErrObjectNotExist) {
+		var nske *types.NoSuchKey
+		if errors.As(err, &nske) {
 			return 0, os.ErrNotExist
 		}
 		return 0, err
