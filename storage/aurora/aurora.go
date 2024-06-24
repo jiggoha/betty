@@ -24,7 +24,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -32,6 +31,10 @@ import (
 	"sync"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	_ "github.com/go-sql-driver/mysql"
 
 	"github.com/AlCutter/betty/log/writer"
@@ -40,8 +43,6 @@ import (
 	"github.com/transparency-dev/serverless-log/api/layout"
 	"golang.org/x/mod/sumdb/note"
 	"golang.org/x/sync/errgroup"
-	"google.golang.org/api/googleapi"
-	"google.golang.org/api/iterator"
 	"k8s.io/klog/v2"
 
 	gcs "cloud.google.com/go/storage"
@@ -69,7 +70,7 @@ var ErrPushback = errors.New("pushback: too many outstanding requests")
 type Storage struct {
 	mu sync.Mutex
 
-	gcsClient *gcs.Client
+	s3Client  s3.Client
 	projectID string
 	// bucket is the name of the bucket where tree data will be stored.
 	bucket string
@@ -132,10 +133,12 @@ type StorageOpts struct {
 // New returns a Client which allows interaction with the log stored in
 // the specified bucket on GCS.
 func New(ctx context.Context, opts StorageOpts, batchMaxSize int, batchMaxAge time.Duration, cpV note.Verifier, cpS note.Signer) *Storage {
-	c, err := gcs.NewClient(ctx)
+	sdkConfig, err := config.LoadDefaultConfig(context.TODO())
 	if err != nil {
-		klog.Exitf("Failed to create GCS storage: %v", err)
+		klog.V(1).Infof("Couldn't load default aws configuration: %v", err)
+		return nil
 	}
+	s3Client := s3.NewFromConfig(sdkConfig)
 
 	//sdkConfig, err := config.LoadDefaultConfig(context.TODO())
 	//if err != nil {
@@ -170,7 +173,7 @@ func New(ctx context.Context, opts StorageOpts, batchMaxSize int, batchMaxAge ti
 	}
 
 	r := &Storage{
-		gcsClient: c,
+		s3Client:  *s3Client,
 		projectID: opts.ProjectID,
 		bucket:    opts.Bucket,
 		dbPool:    dbPool,
@@ -252,17 +255,13 @@ func initDB(ctx context.Context, dbPool *sql.DB) error {
 	return nil
 }
 
-func (c *Storage) bucketExists(ctx context.Context, bucket string) (bool, error) {
-	it := c.gcsClient.Buckets(ctx, c.projectID)
-	for {
-		bAttrs, err := it.Next()
-		if err == iterator.Done {
-			break
-		}
-		if err != nil {
-			return false, err
-		}
-		if bAttrs.Name == bucket {
+func (c *Storage) bucketExists(ctx context.Context, bucketName string) (bool, error) {
+	listBucketsOutput, err := c.s3Client.ListBuckets(ctx, &s3.ListBucketsInput{}) //./ (ctx, c.projectID)
+	if err != nil {
+		return false, fmt.Errorf("LitBuckets(): %v", err)
+	}
+	for _, bucket := range listBucketsOutput.Buckets {
+		if *bucket.Name == bucketName {
 			return true, nil
 		}
 	}
@@ -281,52 +280,46 @@ func (s *Storage) create(ctx context.Context, bucket string) error {
 	}
 
 	// Create the bucket.
-	bkt := s.gcsClient.Bucket(bucket)
-	if err := bkt.Create(ctx, s.projectID, nil); err != nil {
+	bkt := s3.CreateBucketInput{
+		Bucket: aws.String(bucket),
+		// TODO: set ACLs maybe
+	}
+	if _, err := s.s3Client.CreateBucket(ctx, &bkt); err != nil {
 		return fmt.Errorf("failed to create bucket %q in project %s: %w", bucket, s.projectID, err)
 	}
-	bkt.ACL().Set(ctx, gcs.AllUsers, gcs.RoleReader)
 
 	s.bucket = bucket
 	s.nextSeq = 0
 	return nil
 }
 
-// writeCheckpoint stores a raw log checkpoint on GCS if it matches the
-// generation that the client thinks the checkpoint is. The client updates the
-// generation number of the checkpoint whenever ReadCheckpoint is called.
-//
-// This method will fail to write if 1) the checkpoint exists and the client
-// has never read it or 2) the checkpoint has been updated since the client
-// called ReadCheckpoint.
+// WriteCheckpoint stores a raw log checkpoint.
 func (s *Storage) writeCheckpoint(ctx context.Context, newCPRaw []byte) error {
-	bkt := s.gcsClient.Bucket(s.bucket)
-	obj := bkt.Object(layout.CheckpointPath)
-
-	var cond gcs.Conditions
-	if s.checkpointGen == 0 {
-		cond = gcs.Conditions{DoesNotExist: true}
-	} else {
-		cond = gcs.Conditions{GenerationMatch: s.checkpointGen}
+	// TODO(phboneff): make this write to DynamoDB instead
+	path := filepath.Join("", layout.CheckpointPath)
+	if err := s.WriteFile(ctx, path, newCPRaw); err != nil {
+		klog.Infof("Couldn't write checkpoint: %v", err)
 	}
-
-	w := obj.If(cond).NewWriter(ctx)
-	if s.checkpointCacheControl != "" {
-		w.ObjectAttrs.CacheControl = s.checkpointCacheControl
-	}
-	if _, err := w.Write(newCPRaw); err != nil {
-		return err
-	}
-	return w.Close()
+	return nil
 }
 
-func (s *Storage) readCheckpoint(ctx context.Context) ([]byte, int64, error) {
-	cpRaw, mgen, err := s.GetObjectData(ctx, layout.CheckpointPath)
-	if err == nil {
-		s.checkpointGen = mgen
+// WriteFile stores a file on S3.
+func (s *Storage) WriteFile(ctx context.Context, path string, data []byte) error {
+	_, err := s.s3Client.PutObject(ctx, &s3.PutObjectInput{
+		Bucket: aws.String(s.bucket),
+		Key:    aws.String(path),
+		Body:   bytes.NewReader(data),
+	})
+	if err != nil {
+		klog.Infof("Couldn't write data at path %s: %v", path, err)
 	}
+	return nil
+}
 
-	return cpRaw, mgen, err
+func (s *Storage) readCheckpoint(ctx context.Context) ([]byte, error) {
+	cpRaw, err := s.GetObjectData(ctx, layout.CheckpointPath)
+
+	return cpRaw, err
 }
 
 func seqByHashPath(h []byte) string {
@@ -336,7 +329,7 @@ func seqByHashPath(h []byte) string {
 // SequenceForLeafHash returns the sequence number associated with the provided leaf hash.
 // If no such leaf hash has (yet) been integrated into the log, os.ErrNotExist will be returned.
 func (s *Storage) SequenceForLeafHash(ctx context.Context, h []byte) (uint64, error) {
-	d, _, err := s.GetObjectData(ctx, seqByHashPath(h))
+	d, err := s.GetObjectData(ctx, seqByHashPath(h))
 	if err != nil {
 		if errors.Is(err, gcs.ErrObjectNotExist) {
 			return 0, os.ErrNotExist
@@ -351,28 +344,20 @@ func (s *Storage) SequenceForLeafHash(ctx context.Context, h []byte) (uint64, er
 // partial tile for the given tree size at that location.
 func (s *Storage) GetTile(ctx context.Context, level, index, logSize uint64) (*api.Tile, error) {
 	tileSize := layout.PartialTileSize(level, index, logSize)
-	bkt := s.gcsClient.Bucket(s.bucket)
 
 	// Pass an empty rootDir since we don't need this concept in GCS.
 	objName := filepath.Join(layout.TilePath("", level, index, tileSize))
-	r, err := bkt.Object(objName).NewReader(ctx)
+	data, err := s.GetObjectData(ctx, objName)
 	if err != nil {
-		if errors.Is(err, gcs.ErrObjectNotExist) {
-			// Return the generic NotExist error so that tileCache.Visit can differentiate
-			// between this and other errors.
+		var nske *types.NoSuchKey
+		if errors.As(err, &nske) {
 			return nil, os.ErrNotExist
 		}
 		return nil, err
 	}
-	defer r.Close()
-
-	t, err := io.ReadAll(r)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read tile object %q in bucket %q: %v", objName, s.bucket, err)
-	}
 
 	var tile api.Tile
-	if err := tile.UnmarshalText(t); err != nil {
+	if err := tile.UnmarshalText(data); err != nil {
 		return nil, fmt.Errorf("failed to parse tile: %w", err)
 	}
 	return &tile, nil
@@ -386,20 +371,40 @@ func (s *Storage) GetEntryBundle(ctx context.Context, index, size uint64) ([]byt
 		bf = fmt.Sprintf("%s.%d", bf, size)
 	}
 	objName := filepath.Join(bd, bf)
-	d, _, err := s.GetObjectData(ctx, objName)
+	d, err := s.GetObjectData(ctx, objName)
 	return d, err
 }
 
-// GetObjectData returns the bytes of the input object path.
-func (s *Storage) GetObjectData(ctx context.Context, obj string) ([]byte, int64, error) {
-	r, err := s.gcsClient.Bucket(s.bucket).Object(obj).NewReader(ctx)
-	if err != nil {
-		return nil, -1, fmt.Errorf("GetObjectData: failed to create reader for object %q in bucket %q: %w", obj, s.bucket, err)
-	}
-	defer r.Close()
+//// GetObjectData returns the bytes of the input object path.
+//func (s *Storage) GetObjectData(ctx context.Context, obj string) ([]byte, int64, error) {
+//	r, err := s.gcsClient.Bucket(s.bucket).Object(obj).NewReader(ctx)
+//	if err != nil {
+//		return nil, -1, fmt.Errorf("GetObjectData: failed to create reader for object %q in bucket %q: %w", obj, s.bucket, err)
+//	}
+//	defer r.Close()
+//
+//	d, err := io.ReadAll(r)
+//	return d, r.Attrs.Generation, err
+//}
 
-	d, err := io.ReadAll(r)
-	return d, r.Attrs.Generation, err
+// GetObjectData reas a file from S3.
+func (s *Storage) GetObjectData(ctx context.Context, path string) ([]byte, error) {
+	result, err := s.s3Client.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(s.bucket),
+		Key:    aws.String(path),
+	})
+
+	if err != nil {
+		klog.V(2).Infof("Couldn't get object %v:%v. Here's why: %v\n", s.bucket, path, err)
+		return nil, err
+	}
+	defer result.Body.Close()
+	body, err := io.ReadAll(result.Body)
+	if err != nil {
+		klog.Infof("Couldn't read object body from %v. Here's why: %v\n", path, err)
+		return nil, err
+	}
+	return body, nil
 }
 
 // Sequence commits to sequence numbers for an entry
@@ -569,14 +574,14 @@ func (s *Storage) assignSequenceAndIntegrate(ctx context.Context) (bool, error) 
 			objName := filepath.Join(layout.SeqPath("", bundleIndex))
 			b := bundle.Bytes()
 			seqErr.Go(func() error {
-				if err := s.createExclusive(ctx, objName, b); err != nil {
+				if err := s.WriteFile(ctx, objName, b); err != nil {
 					if !errors.Is(os.ErrExist, err) {
 						return err
 					}
 					// TODO: this should be a passed-in leaf ID hash:
 					h := sha256.Sum256(b)
 					seqS := strconv.FormatUint(seq, 10)
-					return s.writeIfNotExists(ctx, seqByHashPath(h[:]), []byte(seqS))
+					return s.WriteFile(ctx, seqByHashPath(h[:]), []byte(seqS))
 				}
 				return nil
 			})
@@ -595,7 +600,7 @@ func (s *Storage) assignSequenceAndIntegrate(ctx context.Context) (bool, error) 
 		bf = fmt.Sprintf("%s.%d", bf, entriesInBundle)
 		seqErr.Go(func() error {
 			b := bundle.Bytes()
-			if err := s.createExclusive(ctx, filepath.Join(bd, bf), b); err != nil {
+			if err := s.WriteFile(ctx, filepath.Join(bd, bf), b); err != nil {
 				if !errors.Is(os.ErrExist, err) {
 					return err
 				}
@@ -637,13 +642,6 @@ func placeholder(n int) string {
 	return strings.Join(places, ",")
 }
 
-func (s *Storage) removeGen(ctx context.Context, gcsPath string, gen int64) error {
-	bkt := s.gcsClient.Bucket(s.bucket)
-	obj := bkt.Object(gcsPath)
-	return obj.If(gcs.Conditions{GenerationMatch: gen}).Delete(ctx)
-
-}
-
 // doIntegrate handles integrating new entries into the log, and updating the checkpoint.
 func (s *Storage) doIntegrate(ctx context.Context, from uint64, batch [][]byte) error {
 	newSize, newRoot, err := writer.Integrate(ctx, from, batch, s, rfc6962.DefaultHasher)
@@ -657,28 +655,14 @@ func (s *Storage) doIntegrate(ctx context.Context, from uint64, batch [][]byte) 
 	return nil
 }
 
-// assertContent checks that the content at `gcsPath` matches the passed in `data`.
-func (c *Storage) assertContent(ctx context.Context, gcsPath string, data []byte) (equal bool, err error) {
-	bkt := c.gcsClient.Bucket(c.bucket)
+// assertContent checks that the content at `s3Path` matches the passed in `data`.
+func (c *Storage) assertContent(ctx context.Context, s3Path string, data []byte) (equal bool, err error) {
+	s3Data, err := c.GetObjectData(ctx, s3Path)
 
-	obj := bkt.Object(gcsPath)
-	r, err := obj.NewReader(ctx)
-	if err != nil {
-		klog.V(2).Infof("assertContent: failed to create reader for object %q in bucket %q: %v",
-			gcsPath, c.bucket, err)
-		return false, err
-	}
-	defer r.Close()
-
-	gcsData, err := io.ReadAll(r)
-	if err != nil {
-		return false, err
-	}
-
-	if bytes.Equal(gcsData, data) {
+	if bytes.Equal(s3Data, data) {
 		return true, nil
 	}
-	klog.V(2).Infof("assertContent(%q):\nGCS:\n%s\nWrite:\n%s", gcsPath, gcsData, data)
+	klog.V(2).Infof("assertContent(%q):\nS3:\n%s\nWrite:\n%s", s3Path, s3Data, data)
 	return false, nil
 }
 
@@ -699,92 +683,19 @@ func (s *Storage) StoreTile(ctx context.Context, level, index uint64, tile *api.
 
 	// Pass an empty rootDir since we don't need this concept in GCS.
 	tPath := filepath.Join(layout.TilePath("", level, index, tileSize%256))
-	return s.createExclusive(ctx, tPath, t)
-}
-
-func (s *Storage) writeIfGen(ctx context.Context, objName string, gen int64, data []byte) error {
-	bkt := s.gcsClient.Bucket(s.bucket)
-	obj := bkt.Object(objName)
-
-	var cond gcs.Conditions
-	if gen == 0 {
-		cond = gcs.Conditions{DoesNotExist: true}
-	} else {
-		cond = gcs.Conditions{GenerationMatch: gen}
-	}
-
-	w := obj.If(cond).NewWriter(ctx)
-	if _, err := w.Write(data); err != nil {
-		return fmt.Errorf("failed to write object %q to bucket %q: %w", objName, s.bucket, err)
-	}
-
-	return w.Close()
-}
-
-func (s *Storage) writeIfNotExists(ctx context.Context, objName string, data []byte) error {
-	bkt := s.gcsClient.Bucket(s.bucket)
-	obj := bkt.Object(objName)
-
-	cond := gcs.Conditions{DoesNotExist: true}
-
-	w := obj.If(cond).NewWriter(ctx)
-	if _, err := w.Write(data); err != nil {
-		return fmt.Errorf("failed to write object %q to bucket %q: %w", objName, s.bucket, err)
-	}
-
-	return w.Close()
-}
-
-func (s *Storage) createExclusive(ctx context.Context, objName string, data []byte) error {
-	bkt := s.gcsClient.Bucket(s.bucket)
-	obj := bkt.Object(objName)
-	// Tiles, partial or full, should only be written once.
-	w := obj.If(gcs.Conditions{DoesNotExist: true}).NewWriter(ctx)
-	if s.otherCacheControl != "" {
-		w.ObjectAttrs.CacheControl = s.otherCacheControl
-	}
-	if _, err := w.Write(data); err != nil {
-		return fmt.Errorf("failed to write tile object %q to bucket %q: %w", objName, s.bucket, err)
-	}
-
-	if err := w.Close(); err != nil {
-		switch ee := err.(type) {
-		case *googleapi.Error:
-			// If we run into a precondition failure error, check that the object
-			// which exists contains the same content that we want to write.
-			if ee.Code == http.StatusPreconditionFailed {
-				if equal, err := s.assertContent(ctx, objName, data); err != nil {
-					return fmt.Errorf("failed to read content of %q: %w", objName, err)
-				} else if !equal {
-					return fmt.Errorf("assertion that resource content for %q has not changed failed", objName)
-				}
-
-				klog.V(2).Infof("createExclusive: identical resource already exists for %q:", objName)
-				return nil
-			}
-		default:
-			return err
-		}
-	}
-
-	return nil
+	return s.WriteFile(ctx, tPath, t)
 }
 
 func (s *Storage) CurrentTree(ctx context.Context) (uint64, []byte, error) {
-	size, hash, _, err := s.currentTreeGen(ctx)
-	return size, hash, err
-}
-
-func (s *Storage) currentTreeGen(ctx context.Context) (uint64, []byte, int64, error) {
-	cpRaw, cpGen, err := s.readCheckpoint(ctx)
+	cpRaw, err := s.readCheckpoint(ctx)
 	if err != nil {
-		return 0, nil, -1, fmt.Errorf("readCheckpoint: %v", err)
+		return 0, nil, fmt.Errorf("readCheckpoint: %v", err)
 	}
 	cp, _, _, err := f_log.ParseCheckpoint(cpRaw, s.cpV.Name(), s.cpV)
 	if err != nil {
-		return 0, nil, -1, err
+		return 0, nil, err
 	}
-	return cp.Size, cp.Hash, cpGen, nil
+	return cp.Size, cp.Hash, nil
 }
 
 func (s *Storage) NewTree(ctx context.Context, size uint64, hash []byte) error {

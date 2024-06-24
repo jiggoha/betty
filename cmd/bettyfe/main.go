@@ -105,9 +105,9 @@ func main() {
 		DBName:          *dbName,
 	}
 	sKey, vKey := keysFromFlag()
-	gcsStorage := aurora.New(ctx, opts, *batchMaxSize, *batchMaxAge, vKey, sKey)
+	s3Storage := aurora.New(ctx, opts, *batchMaxSize, *batchMaxAge, vKey, sKey)
 
-	var s Storage = gcsStorage
+	var s Storage = s3Storage
 
 	if _, _, err := s.CurrentTree(ctx); err != nil {
 		klog.Infof("ct: %v", err)
@@ -155,7 +155,7 @@ func main() {
 	http.HandleFunc("/", func(resp http.ResponseWriter, req *http.Request) {
 		p := req.URL.Path[1:] // strip off leading slash
 		klog.V(4).Infof("HTTP: %v", p)
-		b, _, err := gcsStorage.GetObjectData(ctx, p)
+		b, err := s3Storage.GetObjectData(ctx, p)
 		if err != nil {
 			klog.V(4).Infof("HTTP: %v: %v", p, err)
 			resp.WriteHeader(http.StatusBadRequest)
