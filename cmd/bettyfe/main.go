@@ -140,7 +140,7 @@ func main() {
 		h := sha256.Sum256(b)
 
 		var idx uint64
-		e := betty.NewEntryWithIdentity(b, h[:])
+		e := betty.NewEntry(b, betty.WithIdentity(h[:]))
 		idx, err = sequenceWriter(ctx, e)
 		if err == gcs.ErrPushback {
 			w.WriteHeader(http.StatusTooManyRequests)

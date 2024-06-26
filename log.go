@@ -22,17 +22,27 @@ func (e Entry) Identity() []byte { return e.identity }
 func (e Entry) LeafHash() []byte { return e.leafHash }
 
 // NewEntry creates a new Entry object with leaf data.
-func NewEntry(data []byte) Entry {
-	return Entry{
+func NewEntry(data []byte, opts ...EntryOpt) Entry {
+	e := Entry{
 		data: data,
 	}
+	for _, opt := range opts {
+		opt(&e)
+	}
+	if e.leafHash == nil {
+		e.leafHash = rfc6962.DefaultHasher.HashLeaf(e.data)
+
+	}
+	return e
 }
 
+type EntryOpt func(e *Entry)
+
 // NewEntryWithIdentity creates a new Entry with leaf data and a semantic identity.
-func NewEntryWithIdentity(data []byte, identity []byte) Entry {
-	e := NewEntry(data)
-	e.identity = identity
-	return e
+func WithIdentity(identity []byte) EntryOpt {
+	return func(e *Entry) {
+		e.identity = identity
+	}
 }
 
 // SequenceWriter takes a Entry, assigns it to an index in the log, and returns the assigned index.
