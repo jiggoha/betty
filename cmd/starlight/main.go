@@ -121,8 +121,7 @@ func main() {
 
 		// TODO: this should be a leaf ID hash, and should be passed in to the storage too:
 		h := sha256.Sum256(b)
-		e := betty.NewEntryWithIdentity(b, h[:])
-		betty.BadPractice.SetLeafHash(&e, h[:])
+		e := betty.NewEntry(b, betty.WithIdentity(h[:]), betty.BadPractice.WithLeafHash(h[:]))
 
 		idx, err := sequenceWriter(ctx, e)
 		if err == gcs.ErrPushback {
