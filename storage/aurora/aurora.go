@@ -298,6 +298,7 @@ func (s *Storage) writeCheckpoint(ctx context.Context, newCPRaw []byte) error {
 	path := filepath.Join("", layout.CheckpointPath)
 	if err := s.WriteFile(ctx, path, newCPRaw); err != nil {
 		klog.Infof("Couldn't write checkpoint: %v", err)
+		return err
 	}
 	return nil
 }
@@ -311,6 +312,7 @@ func (s *Storage) WriteFile(ctx context.Context, path string, data []byte) error
 	})
 	if err != nil {
 		klog.Infof("Couldn't write data at path %s: %v", path, err)
+		return err
 	}
 	return nil
 }
