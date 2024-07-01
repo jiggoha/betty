@@ -251,6 +251,14 @@ func initDB(ctx context.Context, dbPool *sql.DB) error {
 		`INSERT IGNORE INTO IntCoord (id, seq) VALUES (0, 0)`); err != nil {
 		return err
 	}
+	if _, err := dbPool.ExecContext(ctx,
+		`CREATE TABLE IF NOT EXISTS Dedup(
+			hash BINARY(32) NOT NULL,
+			seq BIGINT UNSIGNED NOT NULL,
+			PRIMARY KEY (hash)
+		)`); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -330,15 +338,52 @@ func seqByHashPath(h []byte) string {
 // SequenceForLeafHash returns the sequence number associated with the provided leaf hash.
 // If no such leaf hash has (yet) been integrated into the log, os.ErrNotExist will be returned.
 func (s *Storage) SequenceForLeafHash(ctx context.Context, h []byte) (uint64, error) {
-	d, err := s.GetObjectData(ctx, seqByHashPath(h))
+	tx, err := s.dbPool.BeginTx(ctx, nil)
 	if err != nil {
-		var nske *types.NoSuchKey
-		if errors.As(err, &nske) {
-			return 0, os.ErrNotExist
-		}
 		return 0, err
 	}
-	return strconv.ParseUint(string(d), 10, 64)
+	defer func() {
+		if tx != nil {
+			tx.Rollback()
+		}
+	}()
+
+	row := tx.QueryRowContext(ctx, "SELECT seq FROM Dedup WHERE hash = ?", h)
+	var seq uint64
+	if err := row.Scan(&seq); err == sql.ErrNoRows {
+		return 0, os.ErrNotExist
+	} else if err != nil {
+		return 0, fmt.Errorf("failed to read coord info: %v", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("commit: %v", err)
+	}
+
+	return seq, nil
+}
+
+// SetSequenceForLeafHash set a sequence number for the provided leaf hash.
+func (s *Storage) SetSequenceForLeafHash(ctx context.Context, h []byte, idx uint64) error {
+	tx, err := s.dbPool.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if tx != nil {
+			tx.Rollback()
+		}
+	}()
+
+	if _, err := tx.ExecContext(ctx, "INSERT IGNORE INTO Dedup (Hash, Seq) VALUES (?, ?)", h, idx); err != nil {
+		return fmt.Errorf("failed to store hash index: %v", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit: %v", err)
+	}
+
+	return nil
 }
 
 // GetTile returns the tile at the given tile-level and tile-index.

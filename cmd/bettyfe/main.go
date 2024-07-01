@@ -43,6 +43,7 @@ type Storage interface {
 	// Implementations are expected to integrate these new entries in a "timely" fashion.
 	Sequence(context.Context, []byte) (uint64, error)
 	SequenceForLeafHash(context.Context, []byte) (uint64, error)
+	SetSequenceForLeafHash(context.Context, []byte, uint64) error
 	CurrentTree(context.Context) (uint64, []byte, error)
 	NewTree(context.Context, uint64, []byte) error
 }
@@ -142,6 +143,9 @@ func main() {
 				w.WriteHeader(http.StatusInternalServerError)
 				w.Write([]byte(fmt.Sprintf("Failed to sequence entry: %v", err)))
 				return
+			}
+			if err := s.SetSequenceForLeafHash(ctx, h[:], idx); err != nil {
+				klog.V(1).Infof("Coulnd't store dedup info: %v", err)
 			}
 		} else if err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
