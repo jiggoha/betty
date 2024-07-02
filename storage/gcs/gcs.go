@@ -23,7 +23,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -490,8 +489,10 @@ func (s *Storage) assignSequenceAndIntegrate(ctx context.Context) (bool, error) 
 			}
 			klog.Infof("SA: Sequencing & integrate: did %d @ %.1f qps took %0.1fs [r:%vs s:%vs i:%vs q:%vs]", numAdded, qps, d, f(now, readDone), f(readDone, sequenceDone), f(sequenceDone, integrateDone), f(integrateDone, sqlDone))
 		}()
-		// rows := txn.Read(ctx, "Seq", spanner.Key{0}.AsPrefix(), []string{"seq", "v"})
-		rows := txn.Read(ctx, "Seq", spanner.KeyRange{Start: spanner.Key{0, fromSeq}, End: spanner.Key{0, math.MaxInt64}}, []string{"seq", "v"})
+		//rows := txn.Read(ctx, "Seq", spanner.Key{0}.AsPrefix(), []string{"seq", "v"})
+		//rows := txn.Read(ctx, "Seq", spanner.KeyRange{Start: spanner.Key{0, fromSeq}, End: spanner.Key{0, math.MaxInt64}}, []string{"seq", "v"})
+		//rows := txn.Read(ctx, "Seq", spanner.Key{0, fromSeq}, []string{"seq", "v"})
+		rows := txn.Read(ctx, "Seq", spanner.KeyRange{Start: spanner.Key{0, fromSeq}, End: spanner.Key{0, fromSeq + 2048}}, []string{"seq", "v"})
 		defer rows.Stop()
 
 		seqsConsumed := []int64{}
