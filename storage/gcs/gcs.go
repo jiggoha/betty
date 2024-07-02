@@ -391,6 +391,7 @@ func (s *Storage) flushBatch(ctx context.Context, batch writer.Batch) (uint64, e
 	data := b.Bytes()
 	num := len(batch.Entries)
 	var next int64 // Spanner doesn't support uint64
+	pushback := false
 
 	_, err := s.dbPool.ReadWriteTransaction(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
 		row, err := txn.ReadRow(ctx, "SeqCoord", spanner.Key{0}, []string{"id", "next"})
@@ -404,6 +405,7 @@ func (s *Storage) flushBatch(ctx context.Context, batch writer.Batch) (uint64, e
 		next := uint64(next) // spanner doesn't support uint64
 		if next-s.curSize > s.pushBackLimit {
 			klog.Infof("Pushback: %d-%d > %d", next, s.curSize, s.pushBackLimit)
+			pushback = true
 			return ErrPushback
 		}
 		m := []*spanner.Mutation{
@@ -419,6 +421,9 @@ func (s *Storage) flushBatch(ctx context.Context, batch writer.Batch) (uint64, e
 	})
 
 	if err != nil {
+		if pushback {
+			return 0, ErrPushback
+		}
 		return 0, fmt.Errorf("failed to flush batch: %v", err)
 	}
 

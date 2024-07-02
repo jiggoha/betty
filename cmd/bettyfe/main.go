@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/sha256"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -134,7 +135,7 @@ func main() {
 		var idx uint64
 		if seq, err := s.SequenceForLeafHash(ctx, h[:]); err == os.ErrNotExist {
 			idx, err = s.Sequence(ctx, b)
-			if err == gcs.ErrPushback {
+			if errors.Is(err, gcs.ErrPushback) {
 				w.WriteHeader(http.StatusTooManyRequests)
 				w.Write([]byte(fmt.Sprintf("Back off: %v", err)))
 				return
