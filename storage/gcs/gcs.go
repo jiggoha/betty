@@ -100,6 +100,8 @@ type Storage struct {
 	curSize uint64
 
 	pushBackLimit uint64
+
+	sequenceWork chan struct{}
 }
 
 // StorageOpts holds configuration options for the storage client.
@@ -161,6 +163,7 @@ func New(ctx context.Context, opts StorageOpts, batchMaxSize int, batchMaxAge ti
 		pushBackLimit:          opts.PushBackLimit,
 		cpV:                    cpV,
 		cpS:                    cpS,
+		sequenceWork:           make(chan struct{}, 1),
 	}
 	if e, err := r.bucketExists(ctx, opts.Bucket); err != nil {
 		klog.Exitf("Failed to check whether bucket %q exists: %v", opts.Bucket, err)
@@ -179,17 +182,18 @@ func New(ctx context.Context, opts StorageOpts, batchMaxSize int, batchMaxAge ti
 			case <-ctx.Done():
 				return
 			case <-t.C:
-				for {
-					cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-					defer cancel()
-					if more, err := r.assignSequenceAndIntegrate(cctx); err != nil {
-						klog.Errorf("assignSequenceAndIntegrate: %v", err)
-						break
-					} else if !more {
-						break
-					}
-					klog.Info("Quickloop")
+			case <-r.sequenceWork:
+			}
+			for {
+				cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+				defer cancel()
+				if more, err := r.assignSequenceAndIntegrate(cctx); err != nil {
+					klog.Errorf("assignSequenceAndIntegrate: %v", err)
+					break
+				} else if !more {
+					break
 				}
+				klog.Info("Quickloop")
 			}
 		}
 	}()
@@ -425,6 +429,11 @@ func (s *Storage) flushBatch(ctx context.Context, batch writer.Batch) (uint64, e
 			return 0, ErrPushback
 		}
 		return 0, fmt.Errorf("failed to flush batch: %v", err)
+	}
+
+	select {
+	case s.sequenceWork <- struct{}{}:
+	default:
 	}
 
 	return uint64(next), nil
