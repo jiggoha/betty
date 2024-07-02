@@ -32,6 +32,7 @@ import (
 	"time"
 
 	"cloud.google.com/go/spanner"
+	"cloud.google.com/go/spanner/apiv1/spannerpb"
 	"github.com/AlCutter/betty/log/writer"
 	"github.com/transparency-dev/merkle/rfc6962"
 	"github.com/transparency-dev/serverless-log/api"
@@ -402,7 +403,7 @@ func (s *Storage) flushBatch(ctx context.Context, batch writer.Batch) (uint64, e
 	pushback := false
 
 	_, err := s.dbPool.ReadWriteTransaction(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
-		row, err := txn.ReadRow(ctx, "SeqCoord", spanner.Key{0}, []string{"id", "next"})
+		row, err := txn.ReadRowWithOptions(ctx, "SeqCoord", spanner.Key{0}, []string{"id", "next"}, &spanner.ReadOptions{LockHint: spannerpb.ReadRequest_LOCK_HINT_EXCLUSIVE})
 		if err != nil {
 			return err
 		}
@@ -463,7 +464,7 @@ func (s *Storage) assignSequenceAndIntegrate(ctx context.Context) (bool, error) 
 	didWork := false
 
 	_, err := s.dbPool.ReadWriteTransaction(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
-		row, err := txn.ReadRow(ctx, "IntCoord", spanner.Key{0}, []string{"seq"})
+		row, err := txn.ReadRowWithOptions(ctx, "IntCoord", spanner.Key{0}, []string{"seq"}, &spanner.ReadOptions{LockHint: spannerpb.ReadRequest_LOCK_HINT_EXCLUSIVE})
 		if err != nil {
 			return err
 		}
@@ -492,7 +493,7 @@ func (s *Storage) assignSequenceAndIntegrate(ctx context.Context) (bool, error) 
 		//rows := txn.Read(ctx, "Seq", spanner.Key{0}.AsPrefix(), []string{"seq", "v"})
 		//rows := txn.Read(ctx, "Seq", spanner.KeyRange{Start: spanner.Key{0, fromSeq}, End: spanner.Key{0, math.MaxInt64}}, []string{"seq", "v"})
 		//rows := txn.Read(ctx, "Seq", spanner.Key{0, fromSeq}, []string{"seq", "v"})
-		rows := txn.Read(ctx, "Seq", spanner.KeyRange{Start: spanner.Key{0, fromSeq}, End: spanner.Key{0, fromSeq + 2048}}, []string{"seq", "v"})
+		rows := txn.ReadWithOptions(ctx, "Seq", spanner.KeyRange{Start: spanner.Key{0, fromSeq}, End: spanner.Key{0, fromSeq + 2048}}, []string{"seq", "v"}, &spanner.ReadOptions{LockHint: spannerpb.ReadRequest_LOCK_HINT_EXCLUSIVE})
 		defer rows.Stop()
 
 		seqsConsumed := []int64{}
