@@ -177,14 +177,14 @@ func New(ctx context.Context, opts StorageOpts, batchMaxSize int, batchMaxAge ti
 
 	r.pool = writer.NewPool(batchMaxSize, batchMaxAge, r.sequenceBatch)
 	go func() {
-		t := time.NewTicker(5 * time.Second)
+		t := time.NewTicker(500 * time.Millisecond)
 		defer t.Stop()
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case <-t.C:
-			case <-r.sequenceWork:
+				//	case <-r.sequenceWork:
 			}
 			for {
 				cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
