@@ -12,6 +12,9 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/h2c"
+
 	"github.com/AlCutter/betty/storage/gcs"
 	"golang.org/x/mod/sumdb/note"
 	"k8s.io/klog/v2"
@@ -166,7 +169,18 @@ func main() {
 	})
 
 	go printStats(ctx, s.CurrentTree, l)
-	if err := http.ListenAndServe(*listen, http.DefaultServeMux); err != nil {
+
+	h2s := &http2.Server{}
+
+	server := &http.Server{
+		Addr:    *listen,
+		Handler: h2c.NewHandler(http.DefaultServeMux, h2s),
+	}
+
+	if err := http2.ConfigureServer(server, h2s); err != nil {
+		klog.Exitf("http2.ConfigureServer: %v", err)
+	}
+	if err := server.ListenAndServe(); err != nil {
 		klog.Exitf("ListenAndServe: %v", err)
 	}
 }
