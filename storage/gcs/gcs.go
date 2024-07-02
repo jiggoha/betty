@@ -18,13 +18,11 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
-	"database/sql"
 	"encoding/base64"
 	"encoding/gob"
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -33,6 +31,7 @@ import (
 	"sync"
 	"time"
 
+	"cloud.google.com/go/spanner"
 	"github.com/AlCutter/betty/log/writer"
 	"github.com/transparency-dev/merkle/rfc6962"
 	"github.com/transparency-dev/serverless-log/api"
@@ -41,10 +40,8 @@ import (
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/api/googleapi"
 	"google.golang.org/api/iterator"
+	"google.golang.org/grpc/codes"
 	"k8s.io/klog/v2"
-
-	"cloud.google.com/go/cloudsqlconn"
-	"github.com/go-sql-driver/mysql"
 
 	gcs "cloud.google.com/go/storage"
 	f_log "github.com/transparency-dev/formats/log"
@@ -76,7 +73,7 @@ type Storage struct {
 	// bucket is the name of the bucket where tree data will be stored.
 	bucket string
 
-	dbPool *sql.DB
+	dbPool *spanner.Client
 
 	// nextSeq is a hint to the Sequence func as to what the next available
 	// sequence number is to help performance.
@@ -139,24 +136,13 @@ func New(ctx context.Context, opts StorageOpts, batchMaxSize int, batchMaxAge ti
 		klog.Exitf("Failed to create GCS storage: %v", err)
 	}
 
-	d, err := cloudsqlconn.NewDialer(context.Background())
+	sClient, err := spanner.NewClient(ctx, opts.DBName)
 	if err != nil {
-		klog.Exitf("cloudsqlconn.NewDialer: %v", err)
+		klog.Exitf("Failed to connect to Spanner: %v", err)
 	}
-	mysql.RegisterDialContext("cloudsqlconn",
-		func(ctx context.Context, addr string) (net.Conn, error) {
-			return d.Dial(ctx, opts.DBConn)
-		})
+	//defer dataClient.Close()
 
-	dbURI := fmt.Sprintf("%s:%s@cloudsqlconn(localhost:3306)/%s?parseTime=true",
-		opts.DBUser, opts.DBPass, opts.DBName)
-
-	dbPool, err := sql.Open("mysql", dbURI)
-	if err != nil {
-		klog.Exitf("Failed to open CloudSQL: %v", err)
-	}
-
-	if err := initDB(ctx, dbPool); err != nil {
+	if err := initDB(ctx, sClient); err != nil {
 		klog.Exitf("Failed to init DB: %v", err)
 	}
 
@@ -164,7 +150,7 @@ func New(ctx context.Context, opts StorageOpts, batchMaxSize int, batchMaxAge ti
 		gcsClient: c,
 		projectID: opts.ProjectID,
 		bucket:    opts.Bucket,
-		dbPool:    dbPool,
+		dbPool:    sClient,
 
 		checkpointGen:          0,
 		checkpointCacheControl: opts.CheckpointCacheControl,
@@ -210,34 +196,30 @@ func New(ctx context.Context, opts StorageOpts, batchMaxSize int, batchMaxAge ti
 	return r
 }
 
-func initDB(ctx context.Context, dbPool *sql.DB) error {
-	if _, err := dbPool.ExecContext(ctx,
-		`CREATE TABLE IF NOT EXISTS SeqCoord(
-			id INT UNSIGNED NOT NULL,
-			next BIGINT UNSIGNED NOT NULL,
-			PRIMARY KEY (id)
-		)`); err != nil {
-		return err
-	}
-	if _, err := dbPool.ExecContext(ctx,
-		`CREATE TABLE IF NOT EXISTS Seq(
-			id INT UNSIGNED NOT NULL,
-			seq BIGINT UNSIGNED NOT NULL,
-			v LONGBLOB,
-			PRIMARY KEY (id, seq)
-		)`); err != nil {
-		return err
-	}
-	if _, err := dbPool.ExecContext(ctx,
-		`CREATE TABLE IF NOT EXISTS IntCoord(
-			id INT UNSIGNED NOT NULL,
-			seq BIGINT UNSIGNED NOT NULL,
-			PRIMARY KEY (id)
-		)`); err != nil {
-		return err
-	}
-	if _, err := dbPool.ExecContext(ctx,
-		`INSERT IGNORE INTO IntCoord (id, seq) VALUES (0, 0)`); err != nil {
+func initDB(ctx context.Context, dbPool *spanner.Client) error {
+	/*
+				// Done in UI:
+		CREATE TABLE SeqCoord (
+		 id INT64 NOT NULL,
+		 next INT64 NOT NULL,
+		) PRIMARY KEY (id);
+
+		CREATE TABLE Seq (
+			id INT64 NOT NULL,
+			seq INT64 NOT NULL,
+			v BYTES(MAX),
+		) PRIMARY KEY (id, seq);
+
+		CREATE TABLE IntCoord (
+			id INT64 NOT NULL,
+			seq INT64 NOT NULL,
+		) PRIMARY KEY (id);
+	*/
+
+	if _, err := dbPool.Apply(ctx, []*spanner.Mutation{spanner.Insert("IntCoord", []string{"id", "seq"}, []interface{}{0, 0})}); err != nil {
+		if spanner.ErrCode(err) == codes.AlreadyExists {
+			return nil
+		}
 		return err
 	}
 	return nil
@@ -407,44 +389,42 @@ func (s *Storage) flushBatch(ctx context.Context, batch writer.Batch) (uint64, e
 	}
 	data := b.Bytes()
 	num := len(batch.Entries)
+	var next uint64
 
-	tx, err := s.dbPool.BeginTx(ctx, nil)
-	if err != nil {
-		return 0, fmt.Errorf("failed to begin tx: %v", err)
-	}
-	defer func() {
-		if tx != nil {
-			tx.Rollback()
+	_, err := s.dbPool.ReadWriteTransaction(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
+		row, err := txn.ReadRow(ctx, "SeqCoord", spanner.Key{0}, []string{"id, next"})
+		if err != nil {
+			return err
 		}
-	}()
-
-	r := tx.QueryRowContext(ctx, "SELECT id, next FROM SeqCoord WHERE id = ? FOR UPDATE", 0)
-	var id, next uint64
-	if err := r.Scan(&id, &next); err == sql.ErrNoRows {
+		var id uint64
+		if err := row.Columns(&id, &next); err != nil {
+			return err
+		}
+		if next-s.curSize > s.pushBackLimit {
+			klog.Infof("Pushback: %d-%d > %d", next, s.curSize, s.pushBackLimit)
+			return ErrPushback
+		}
 		klog.Info("New log - first sequence")
-		if _, err := tx.ExecContext(ctx, "INSERT INTO SeqCoord (id, next) VALUES (?, ?)", 0, next+uint64(num)); err != nil {
-			return 0, fmt.Errorf("init new log in seqcoord: %v", err)
+		stmt := spanner.NewStatement("INSERT SeqCoord(id, next) VALUES (0, @next)")
+		stmt.Params["next"] = next + uint64(num)
+		if _, err := txn.Update(ctx, stmt); err != nil {
+			return fmt.Errorf("init new log in seqcoord: %v", err)
 		}
-	} else if err != nil {
-		return 0, fmt.Errorf("failed to read seqcoord: %v", err)
-	}
+		m := []*spanner.Mutation{
+			spanner.Insert("Seq", []string{"id", "seq"}, []interface{}{0, next, data}),
+			spanner.Update("SeqCoord", []string{"id", "next"}, []interface{}{0, next + uint64(num)}),
+		}
 
-	if next-s.curSize > s.pushBackLimit {
-		klog.Infof("Pushback: %d-%d > %d", next, s.curSize, s.pushBackLimit)
-		return 0, ErrPushback
-	}
+		if err := txn.BufferWrite(m); err != nil {
+			return err
+		}
 
-	if _, err := tx.ExecContext(ctx, "INSERT INTO Seq(id, seq, v) VALUES(?, ?, ?)", 0, next, data); err != nil {
-		return 0, fmt.Errorf("insert into seq: %v", err)
-	}
-	if _, err := tx.ExecContext(ctx, "UPDATE SeqCoord SET next = ? WHERE ID = ?", next+uint64(num), 0); err != nil {
-		return 0, fmt.Errorf("update seqcoord: %v", err)
-	}
+		return nil
+	})
 
-	if err := tx.Commit(); err != nil {
-		return 0, fmt.Errorf("commit: %v", err)
+	if err != nil {
+		return 0, fmt.Errorf("failed to flush batch: %v", err)
 	}
-	tx = nil
 
 	return next, nil
 }
@@ -460,163 +440,160 @@ func (s *Storage) sequenceBatch(ctx context.Context, batch writer.Batch) (uint64
 }
 
 func (s *Storage) assignSequenceAndIntegrate(ctx context.Context) (bool, error) {
-	tx, err := s.dbPool.BeginTx(ctx, nil)
-	if err != nil {
-		return false, err
-	}
-	defer func() {
-		if tx != nil {
-			tx.Rollback()
-		}
-	}()
-
-	row := tx.QueryRowContext(ctx, "SELECT seq FROM IntCoord WHERE id = ? FOR UPDATE", 0)
-	var fromSeq uint64
-	if err := row.Scan(&fromSeq); err == sql.ErrNoRows {
-		return false, nil
-	} else if err != nil {
-		return false, fmt.Errorf("failed to read coord info: %v", err)
-	}
-
-	s.curSize = fromSeq
 	now := time.Now()
 	readDone := time.Time{}
 	sequenceDone := time.Time{}
 	integrateDone := time.Time{}
 	sqlDone := time.Time{}
 
-	numAdded := 0
+	_, err := s.dbPool.ReadWriteTransaction(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
 
-	klog.Infof("SA: Starting sequence & integrate...")
-	defer func() {
-		d := float64(time.Now().Sub(now)) / float64(time.Second)
-		qps := 0.0
-		if d > 0 {
-			qps = float64(numAdded) / d
-		}
-		f := func(s, e time.Time) string {
-			return fmt.Sprintf("%0.1f", float64(e.Sub(s))/float64(time.Second))
-		}
-		klog.Infof("SA: Sequencing & integrate: did %d @ %.1f qps took %0.1fs [r:%vs s:%vs i:%vs q:%vs]", numAdded, qps, d, f(now, readDone), f(readDone, sequenceDone), f(sequenceDone, integrateDone), f(integrateDone, sqlDone))
-	}()
-
-	rows, err := tx.QueryContext(ctx, "SELECT seq, v FROM Seq WHERE id = ? AND seq >= ? ORDER BY SEQ LIMIT 10 FOR UPDATE", 0, fromSeq)
-	if err != nil {
-		return false, fmt.Errorf("failed to read Seq: %v", err)
-	}
-	defer rows.Close()
-
-	seqsConsumed := []any{}
-	batch := writer.Batch{}
-
-	orderCheck := fromSeq
-	for rows.Next() {
-		var batchGob []byte
-		var seq uint64
-		if err := rows.Scan(&seq, &batchGob); err != nil {
-			return false, fmt.Errorf("failed to scan seq row: %v", err)
-		}
-		seqsConsumed = append(seqsConsumed, seq)
-		if orderCheck != seq {
-			return false, fmt.Errorf("integrity fail - expected seq %d, but started at %d", orderCheck, seq)
-		}
-
-		g := gob.NewDecoder(bytes.NewReader(batchGob))
-		b := writer.Batch{}
-		if err := g.Decode(&b); err != nil {
-			return false, fmt.Errorf("failed to deserialise batch: %v", err)
-		}
-		batch.Entries = append(batch.Entries, b.Entries...)
-		orderCheck = seq + uint64(len(b.Entries))
-	}
-	if len(seqsConsumed) == 0 {
-		return false, nil
-	}
-	readDone = time.Now()
-
-	seq := fromSeq
-	bundleIndex, entriesInBundle := seq/uint64(s.entryBundleSize), seq%uint64(s.entryBundleSize)
-	bundle := &bytes.Buffer{}
-	if entriesInBundle > 0 {
-		// If the latest bundle is partial, we need to read the data it contains in for our newer, larger, bundle.
-		part, err := s.GetEntryBundle(ctx, bundleIndex, entriesInBundle)
+		row, err := txn.ReadRow(ctx, "IntCoord", spanner.Key{0}, []string{"seq"})
 		if err != nil {
-			return false, err
+			return err
 		}
-		bundle.Write(part)
-	}
+		// handle no such row
+		var fromSeq uint64
+		if err := row.Column(0, &fromSeq); err != nil {
+			return fmt.Errorf("failed to read coord info: %v", err)
+		}
 
-	seqErr := errgroup.Group{}
-	// Add new entries to the bundle
-	for _, e := range batch.Entries {
-		bundle.WriteString(base64.StdEncoding.EncodeToString(e))
-		bundle.WriteString("\n")
-		entriesInBundle++
-		seq++
-		numAdded++
-		if entriesInBundle == uint64(s.entryBundleSize) {
-			//  This bundle is full, so we need to write it out...
-			klog.V(1).Infof("Bundle idx %x is full", bundleIndex)
-			objName := filepath.Join(layout.SeqPath("", bundleIndex))
-			b := bundle.Bytes()
+		s.curSize = fromSeq
+		numAdded := 0
+
+		klog.Infof("SA: Starting sequence & integrate...")
+		defer func() {
+			d := float64(time.Now().Sub(now)) / float64(time.Second)
+			qps := 0.0
+			if d > 0 {
+				qps = float64(numAdded) / d
+			}
+			f := func(s, e time.Time) string {
+				return fmt.Sprintf("%0.1f", float64(e.Sub(s))/float64(time.Second))
+			}
+			klog.Infof("SA: Sequencing & integrate: did %d @ %.1f qps took %0.1fs [r:%vs s:%vs i:%vs q:%vs]", numAdded, qps, d, f(now, readDone), f(readDone, sequenceDone), f(sequenceDone, integrateDone), f(integrateDone, sqlDone))
+		}()
+		rows := txn.Read(ctx, "Seq", spanner.Key{0, spanner.KeyRange{Start: spanner.Key{fromSeq}}}, []string{"seq", "v"})
+		defer rows.Stop()
+
+		seqsConsumed := []any{}
+		batch := writer.Batch{}
+
+		orderCheck := fromSeq
+		for {
+			row, err := rows.Next()
+			if err == iterator.Done {
+				break
+			}
+			var batchGob []byte
+			var seq uint64
+			if err := row.Columns(&seq, &batchGob); err != nil {
+				return fmt.Errorf("failed to scan seq row: %v", err)
+			}
+			seqsConsumed = append(seqsConsumed, seq)
+			if orderCheck != seq {
+				return fmt.Errorf("integrity fail - expected seq %d, but started at %d", orderCheck, seq)
+			}
+
+			g := gob.NewDecoder(bytes.NewReader(batchGob))
+			b := writer.Batch{}
+			if err := g.Decode(&b); err != nil {
+				return fmt.Errorf("failed to deserialise batch: %v", err)
+			}
+			batch.Entries = append(batch.Entries, b.Entries...)
+			orderCheck = seq + uint64(len(b.Entries))
+		}
+		if len(seqsConsumed) == 0 {
+			return nil
+		}
+		readDone = time.Now()
+
+		seq := fromSeq
+		bundleIndex, entriesInBundle := seq/uint64(s.entryBundleSize), seq%uint64(s.entryBundleSize)
+		bundle := &bytes.Buffer{}
+		if entriesInBundle > 0 {
+			// If the latest bundle is partial, we need to read the data it contains in for our newer, larger, bundle.
+			part, err := s.GetEntryBundle(ctx, bundleIndex, entriesInBundle)
+			if err != nil {
+				return err
+			}
+			bundle.Write(part)
+		}
+
+		seqErr := errgroup.Group{}
+		// Add new entries to the bundle
+		for _, e := range batch.Entries {
+			bundle.WriteString(base64.StdEncoding.EncodeToString(e))
+			bundle.WriteString("\n")
+			entriesInBundle++
+			seq++
+			numAdded++
+			if entriesInBundle == uint64(s.entryBundleSize) {
+				//  This bundle is full, so we need to write it out...
+				klog.V(1).Infof("Bundle idx %x is full", bundleIndex)
+				objName := filepath.Join(layout.SeqPath("", bundleIndex))
+				b := bundle.Bytes()
+				seqErr.Go(func() error {
+					if err := s.createExclusive(ctx, objName, b); err != nil {
+						if !errors.Is(os.ErrExist, err) {
+							return err
+						}
+						// TODO: this should be a passed-in leaf ID hash:
+						h := sha256.Sum256(b)
+						seqS := strconv.FormatUint(seq, 10)
+						return s.writeIfNotExists(ctx, seqByHashPath(h[:]), []byte(seqS))
+					}
+					return nil
+				})
+				// ... and prepare the next entry bundle for any remaining entries in the batch
+				bundleIndex++
+				entriesInBundle = 0
+				bundle = &bytes.Buffer{}
+				klog.V(1).Infof("Starting bundle idx %d", bundleIndex)
+			}
+		}
+		// If we have a partial bundle remaining once we've added all the entries from the batch,
+		// this needs writing out too.
+		if entriesInBundle > 0 {
+			klog.V(1).Infof("Writing partial bundle idx %d.%d", bundleIndex, entriesInBundle)
+			bd, bf := layout.SeqPath("", bundleIndex)
+			bf = fmt.Sprintf("%s.%d", bf, entriesInBundle)
 			seqErr.Go(func() error {
-				if err := s.createExclusive(ctx, objName, b); err != nil {
+				b := bundle.Bytes()
+				if err := s.createExclusive(ctx, filepath.Join(bd, bf), b); err != nil {
 					if !errors.Is(os.ErrExist, err) {
 						return err
 					}
-					// TODO: this should be a passed-in leaf ID hash:
-					h := sha256.Sum256(b)
-					seqS := strconv.FormatUint(seq, 10)
-					return s.writeIfNotExists(ctx, seqByHashPath(h[:]), []byte(seqS))
 				}
 				return nil
 			})
-			// ... and prepare the next entry bundle for any remaining entries in the batch
-			bundleIndex++
-			entriesInBundle = 0
-			bundle = &bytes.Buffer{}
-			klog.V(1).Infof("Starting bundle idx %d", bundleIndex)
 		}
-	}
-	// If we have a partial bundle remaining once we've added all the entries from the batch,
-	// this needs writing out too.
-	if entriesInBundle > 0 {
-		klog.V(1).Infof("Writing partial bundle idx %d.%d", bundleIndex, entriesInBundle)
-		bd, bf := layout.SeqPath("", bundleIndex)
-		bf = fmt.Sprintf("%s.%d", bf, entriesInBundle)
-		seqErr.Go(func() error {
-			b := bundle.Bytes()
-			if err := s.createExclusive(ctx, filepath.Join(bd, bf), b); err != nil {
-				if !errors.Is(os.ErrExist, err) {
-					return err
-				}
-			}
-			return nil
-		})
-	}
-	if err := seqErr.Wait(); err != nil {
+		if err := seqErr.Wait(); err != nil {
+			return err
+		}
+		sequenceDone = time.Now()
+
+		if err := s.doIntegrate(ctx, fromSeq, batch.Entries); err != nil {
+			return fmt.Errorf("failed to integrate: %v", err)
+		}
+		integrateDone = time.Now()
+
+		m := make([]*spanner.Mutation, 0)
+		m = append(m, spanner.Update("IntCoord", []string{"id", "seq"}, []interface{}{0, seq}))
+
+		for _, c := range seqsConsumed {
+			m = append(m, spanner.Delete("Seq", spanner.Key{0, c}))
+		}
+		if err := txn.BufferWrite(m); err != nil {
+			return err
+		}
+
+		return nil
+	})
+	if err != nil {
 		return false, err
 	}
-	sequenceDone = time.Now()
-
-	if err := s.doIntegrate(ctx, fromSeq, batch.Entries); err != nil {
-		return false, fmt.Errorf("failed to integrate: %v", err)
-	}
-	integrateDone = time.Now()
-
-	if _, err := tx.ExecContext(ctx, "UPDATE IntCoord SET Seq=? WHERE ID=?", seq, 0); err != nil {
-		return false, fmt.Errorf("update intcoord: %v", err)
-	}
-	q := "DELETE FROM Seq WHERE ID=? AND seq IN ( " + placeholder(len(seqsConsumed)) + " )"
-	if _, err := tx.ExecContext(ctx, q, append([]any{0}, seqsConsumed...)...); err != nil {
-		klog.Infof("Q: %s", q)
-		return false, fmt.Errorf("update intcoord: %v", err)
-	}
-	if err := tx.Commit(); err != nil {
-		return false, fmt.Errorf("commit: %v", err)
-	}
 	sqlDone = time.Now()
-	tx = nil
 	return true, nil
 }
 
