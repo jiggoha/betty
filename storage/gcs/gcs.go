@@ -102,6 +102,8 @@ type Storage struct {
 	pushBackLimit uint64
 
 	sequenceWork chan struct{}
+
+	pushbackUntil time.Time
 }
 
 // StorageOpts holds configuration options for the storage client.
@@ -383,6 +385,9 @@ func (s *Storage) GetObjectData(ctx context.Context, obj string) ([]byte, int64,
 // Sequence commits to sequence numbers for an entry
 // Returns the sequence number assigned to the first entry in the batch, or an error.
 func (s *Storage) Sequence(ctx context.Context, leaf []byte) (uint64, error) {
+	if time.Now().Before(s.pushbackUntil) {
+		return 0, ErrPushback
+	}
 	return s.pool.Add(leaf)
 }
 
@@ -410,6 +415,7 @@ func (s *Storage) flushBatch(ctx context.Context, batch writer.Batch) (uint64, e
 		if next-s.curSize > s.pushBackLimit {
 			klog.Infof("Pushback: %d-%d > %d", next, s.curSize, s.pushBackLimit)
 			pushback = true
+			s.pushbackUntil = time.Now().Add(500 * time.Millisecond)
 			return ErrPushback
 		}
 		m := []*spanner.Mutation{
