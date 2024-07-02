@@ -447,11 +447,12 @@ func (s *Storage) assignSequenceAndIntegrate(ctx context.Context) (bool, error) 
 		if err != nil {
 			return err
 		}
-		// handle no such row
+		// TODO: handle no such row?
 		var fromSeq int64 // Spanner doesn't support uint64
 		if err := row.Column(0, &fromSeq); err != nil {
 			return fmt.Errorf("failed to read coord info: %v", err)
 		}
+		klog.Infof("Fromseq: %d", fromSeq)
 
 		s.curSize = uint64(fromSeq)
 		numAdded := 0
@@ -468,7 +469,7 @@ func (s *Storage) assignSequenceAndIntegrate(ctx context.Context) (bool, error) 
 			}
 			klog.Infof("SA: Sequencing & integrate: did %d @ %.1f qps took %0.1fs [r:%vs s:%vs i:%vs q:%vs]", numAdded, qps, d, f(now, readDone), f(readDone, sequenceDone), f(sequenceDone, integrateDone), f(integrateDone, sqlDone))
 		}()
-		rows := txn.Read(ctx, "Seq", spanner.Key{0, spanner.KeyRange{Start: spanner.Key{fromSeq}}}, []string{"seq", "v"})
+		rows := txn.Read(ctx, "Seq", spanner.Key{0}.AsPrefix(), []string{"seq", "v"})
 		defer rows.Stop()
 
 		seqsConsumed := []int64{}
@@ -480,7 +481,7 @@ func (s *Storage) assignSequenceAndIntegrate(ctx context.Context) (bool, error) 
 			if row == nil || err == iterator.Done {
 				break
 			}
-			batchGob := make([]byte, 0, 2048)
+			var batchGob []byte
 			var seq int64 // spanner doesn't have uint64
 			if err := row.Columns(&seq, &batchGob); err != nil {
 				return fmt.Errorf("failed to scan seq row: %v", err)
@@ -499,6 +500,7 @@ func (s *Storage) assignSequenceAndIntegrate(ctx context.Context) (bool, error) 
 			orderCheck = seq + int64(len(b.Entries))
 		}
 		if len(seqsConsumed) == 0 {
+			klog.Info("Found no rows to sequence")
 			return nil
 		}
 		readDone = time.Now()
