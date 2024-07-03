@@ -402,6 +402,58 @@ func (s *Storage) Sequence(ctx context.Context, leaf []byte) (uint64, error) {
 	return s.pool.Add(leaf)
 }
 
+// AddSequenced commits leaves to the log starting at the index of startSeq.
+func (s *Storage) AddSequenced(ctx context.Context, startSeq uint64, leaves [][]byte) error {
+	batch := writer.Batch{
+		Entries: leaves,
+	}
+
+	b := &bytes.Buffer{}
+	e := gob.NewEncoder(b)
+	if err := e.Encode(batch); err != nil {
+		return fmt.Errorf("failed to serialise batch: %v", err)
+	}
+	data := b.Bytes()
+	num := len(batch.Entries)
+
+	tx, err := s.dbPool.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("failed to begin tx: %v", err)
+	}
+	defer func() {
+		if tx != nil {
+			tx.Rollback()
+		}
+	}()
+
+	// If new log
+	r := tx.QueryRowContext(ctx, "SELECT id, next FROM SeqCoord WHERE id = ? FOR UPDATE", 0)
+	var id, next uint64
+	if err := r.Scan(&id, &next); err == sql.ErrNoRows {
+		klog.Info("New log - first sequence")
+		if _, err := tx.ExecContext(ctx, "INSERT INTO SeqCoord (id, next) VALUES (?, ?)", 0, next+uint64(num)); err != nil {
+			return fmt.Errorf("init new log in seqcoord: %v", err)
+		}
+	} else if err != nil {
+		return fmt.Errorf("failed to read seqcoord: %v", err)
+	}
+
+	// Add presequenced things.
+	if _, err := tx.ExecContext(ctx, "INSERT INTO Seq(id, seq, v) VALUES(?, ?, ?)", 0, startSeq, data); err != nil {
+		return fmt.Errorf("insert into seq: %v", err)
+	}
+	if _, err := tx.ExecContext(ctx, "UPDATE SeqCoord SET next = ? WHERE ID = ?", startSeq+uint64(num), 0); err != nil {
+		return fmt.Errorf("update seqcoord: %v", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit: %v", err)
+	}
+	tx = nil
+
+	return nil
+}
+
 func (s *Storage) flushBatch(ctx context.Context, batch writer.Batch) (uint64, error) {
 	b := &bytes.Buffer{}
 	e := gob.NewEncoder(b)
