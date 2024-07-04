@@ -399,6 +399,30 @@ func (s *Storage) Sequence(ctx context.Context, leaf []byte) (uint64, error) {
 	return s.pool.Add(leaf)
 }
 
+// NextAvailable returns the next available unassigned index.
+func (s *Storage) NextAvailable(ctx context.Context) (uint64, error) {
+	tx, err := s.dbPool.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("failed to begin tx: %v", err)
+	}
+	defer func() {
+		if tx != nil {
+			tx.Rollback()
+		}
+	}()
+
+	r := tx.QueryRowContext(ctx, "SELECT id, next FROM SeqCoord WHERE id = ? FOR UPDATE", 0)
+
+	var id, next uint64
+	if err := r.Scan(&id, &next); err == sql.ErrNoRows {
+		return 0, fmt.Errorf("init new log in seqcoord: %v", err)
+	} else if err != nil {
+		return 0, fmt.Errorf("failed to read seqcoord: %v", err)
+	}
+
+	return next, nil
+}
+
 // AddSequenced commits leaves to the log starting at the index of startSeq.
 func (s *Storage) AddSequenced(ctx context.Context, startSeq uint64, leaves [][]byte) error {
 	batch := writer.Batch{
