@@ -175,6 +175,14 @@ func New(ctx context.Context, opts StorageOpts, batchMaxSize int, batchMaxAge ti
 		cpV:                    cpV,
 		cpS:                    cpS,
 	}
+	if e, err := r.bucketExists(ctx, opts.Bucket); err != nil {
+		klog.Exitf("Failed to check whether bucket %q exists: %v", opts.Bucket, err)
+	} else if !e {
+		if err := r.create(ctx, opts.Bucket); err != nil {
+			klog.Exitf("Failed to create bucket %q: %v", opts.Bucket, err)
+		}
+	}
+
 	r.pool = writer.NewPool(batchMaxSize, batchMaxAge, r.sequenceBatch)
 	go func() {
 		t := time.NewTicker(5 * time.Second)
@@ -235,7 +243,7 @@ func initDB(ctx context.Context, dbPool *sql.DB) error {
 	return nil
 }
 
-func (c *Storage) BucketExists(ctx context.Context, bucket string) (bool, error) {
+func (c *Storage) bucketExists(ctx context.Context, bucket string) (bool, error) {
 	it := c.gcsClient.Buckets(ctx, c.projectID)
 	for {
 		bAttrs, err := it.Next()
@@ -252,10 +260,10 @@ func (c *Storage) BucketExists(ctx context.Context, bucket string) (bool, error)
 	return false, nil
 }
 
-// Create creates a new GCS bucket and returns an error on failure.
-func (s *Storage) Create(ctx context.Context, bucket string) error {
+// create creates a new GCS bucket and returns an error on failure.
+func (s *Storage) create(ctx context.Context, bucket string) error {
 	// Check if the bucket already exists.
-	exists, err := s.BucketExists(ctx, bucket)
+	exists, err := s.bucketExists(ctx, bucket)
 	if err != nil {
 		return err
 	}
@@ -275,19 +283,14 @@ func (s *Storage) Create(ctx context.Context, bucket string) error {
 	return nil
 }
 
-// SetNextSeq sets the input as the nextSeq of the client.
-func (s *Storage) SetNextSeq(num uint64) {
-	s.nextSeq = num
-}
-
-// WriteCheckpoint stores a raw log checkpoint on GCS if it matches the
+// writeCheckpoint stores a raw log checkpoint on GCS if it matches the
 // generation that the client thinks the checkpoint is. The client updates the
 // generation number of the checkpoint whenever ReadCheckpoint is called.
 //
 // This method will fail to write if 1) the checkpoint exists and the client
 // has never read it or 2) the checkpoint has been updated since the client
 // called ReadCheckpoint.
-func (s *Storage) WriteCheckpoint(ctx context.Context, newCPRaw []byte) error {
+func (s *Storage) writeCheckpoint(ctx context.Context, newCPRaw []byte) error {
 	bkt := s.gcsClient.Bucket(s.bucket)
 	obj := bkt.Object(layout.CheckpointPath)
 
@@ -306,12 +309,6 @@ func (s *Storage) WriteCheckpoint(ctx context.Context, newCPRaw []byte) error {
 		return err
 	}
 	return w.Close()
-}
-
-// ReadCheckpoint reads from GCS and returns the contents of the log checkpoint.
-func (s *Storage) ReadCheckpoint(ctx context.Context) ([]byte, error) {
-	b, _, err := s.readCheckpoint(ctx)
-	return b, err
 }
 
 func (s *Storage) readCheckpoint(ctx context.Context) ([]byte, int64, error) {
@@ -843,5 +840,5 @@ func (s *Storage) NewTree(ctx context.Context, size uint64, hash []byte) error {
 	if err != nil {
 		return err
 	}
-	return s.WriteCheckpoint(ctx, n)
+	return s.writeCheckpoint(ctx, n)
 }
