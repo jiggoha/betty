@@ -447,7 +447,8 @@ func (s *Storage) AddSequenced(ctx context.Context, startSeq uint64, leaves [][]
 		}
 	}()
 
-	// If new log
+	// Check that the start index of the leaves provided is consistent with the
+	// next unassigned sequence number.
 	r := tx.QueryRowContext(ctx, "SELECT id, next FROM SeqCoord WHERE id = ? FOR UPDATE", 0)
 	var id, next uint64
 	if err := r.Scan(&id, &next); err == sql.ErrNoRows {
@@ -458,8 +459,11 @@ func (s *Storage) AddSequenced(ctx context.Context, startSeq uint64, leaves [][]
 	} else if err != nil {
 		return fmt.Errorf("failed to read seqcoord: %v", err)
 	}
+	if next != startSeq {
+		return fmt.Errorf("startSeq of AddSequenced call should match SeqCoord: got %d, want %d", startSeq, next)
+	}
 
-	// Add presequenced things.
+	// Add presequenced entries to Seq and update SeqCoord with the number of presequenced entries.
 	if _, err := tx.ExecContext(ctx, "INSERT INTO Seq(id, seq, v) VALUES(?, ?, ?)", 0, startSeq, data); err != nil {
 		return fmt.Errorf("insert into seq: %v", err)
 	}
