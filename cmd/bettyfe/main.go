@@ -42,7 +42,6 @@ type Storage interface {
 	// that index once it's durably committed.
 	// Implementations are expected to integrate these new entries in a "timely" fashion.
 	Sequence(context.Context, []byte) (uint64, error)
-	AddSequenced(context.Context, uint64, [][]byte) error
 	SequenceForLeafHash(context.Context, []byte) (uint64, error)
 	CurrentTree(context.Context) (uint64, []byte, error)
 	NewTree(context.Context, uint64, []byte) error
@@ -117,8 +116,6 @@ func main() {
 		}
 	}
 	l := &latency{}
-
-	s.AddSequenced(ctx, 2, [][]byte{[]byte("fake leaf data")})
 
 	http.HandleFunc("POST /add", func(w http.ResponseWriter, r *http.Request) {
 		n := time.Now()
