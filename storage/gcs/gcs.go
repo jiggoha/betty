@@ -237,6 +237,10 @@ func initDB(ctx context.Context, dbPool *sql.DB) error {
 		return err
 	}
 	if _, err := dbPool.ExecContext(ctx,
+		`INSERT IGNORE INTO SeqCoord (id, next) VALUES (0, 0)`); err != nil {
+		return err
+	}
+	if _, err := dbPool.ExecContext(ctx,
 		`INSERT IGNORE INTO IntCoord (id, seq) VALUES (0, 0)`); err != nil {
 		return err
 	}
@@ -441,12 +445,7 @@ func (s *Storage) AddSequenced(ctx context.Context, startSeq uint64, leaves [][]
 	// next unassigned sequence number.
 	r := tx.QueryRowContext(ctx, "SELECT id, next FROM SeqCoord WHERE id = ? FOR UPDATE", 0)
 	var id, next uint64
-	if err := r.Scan(&id, &next); err == sql.ErrNoRows {
-		klog.Info("New log - first sequence")
-		if _, err := tx.ExecContext(ctx, "INSERT INTO SeqCoord (id, next) VALUES (?, ?)", 0, next+uint64(num)); err != nil {
-			return fmt.Errorf("init new log in seqcoord: %v", err)
-		}
-	} else if err != nil {
+	if err := r.Scan(&id, &next); err != nil {
 		return fmt.Errorf("failed to read seqcoord: %v", err)
 	}
 	if next != startSeq {
