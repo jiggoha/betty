@@ -401,17 +401,7 @@ func (s *Storage) Sequence(ctx context.Context, leaf []byte) (uint64, error) {
 
 // NextAvailable returns the next available unassigned index.
 func (s *Storage) NextAvailable(ctx context.Context) (uint64, error) {
-	tx, err := s.dbPool.BeginTx(ctx, nil)
-	if err != nil {
-		return 0, fmt.Errorf("failed to begin tx: %v", err)
-	}
-	defer func() {
-		if tx != nil {
-			tx.Rollback()
-		}
-	}()
-
-	r := tx.QueryRowContext(ctx, "SELECT id, next FROM SeqCoord WHERE id = ? FOR UPDATE", 0)
+	r := s.dbPool.QueryRowContext(ctx, "SELECT id, next FROM SeqCoord WHERE id = ?", 0)
 
 	var id, next uint64
 	if err := r.Scan(&id, &next); err == sql.ErrNoRows {
