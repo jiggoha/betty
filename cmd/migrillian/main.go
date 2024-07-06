@@ -18,28 +18,23 @@ package main
 
 import (
 	"context"
-	"crypto/tls"
-	"crypto/x509"
 	"errors"
 	"flag"
 	"fmt"
 	"net/http"
 	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
 	clientv3 "go.etcd.io/etcd/client/v3"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials"
-	"google.golang.org/grpc/credentials/insecure"
+	"golang.org/x/mod/sumdb/note"
 	"k8s.io/klog/v2"
 
+	"github.com/AlCutter/betty/migrillian/core"
+	"github.com/AlCutter/betty/storage/gcs"
 	"github.com/google/certificate-transparency-go/client"
 	"github.com/google/certificate-transparency-go/jsonclient"
 	"github.com/google/certificate-transparency-go/trillian/migrillian/configpb"
-	"github.com/google/certificate-transparency-go/trillian/migrillian/core"
-	"github.com/google/trillian"
 	"github.com/google/trillian/monitoring"
 	"github.com/google/trillian/monitoring/prometheus"
 	"github.com/google/trillian/util"
@@ -49,20 +44,61 @@ import (
 )
 
 var (
-	cfgPath = flag.String("config", "", "Path to migration config file")
+	// Migrillian flags
+	cfgPath = flag.String("config", "config/config.textproto", "Path to migration config file")
 
 	forceMaster   = flag.Bool("force_master", false, "If true, assume master for all logs")
 	etcdServers   = flag.String("etcd_servers", "", "A comma-separated list of etcd servers; no etcd registration if empty")
 	lockDir       = flag.String("lock_file_path", "/migrillian/master", "etcd lock file directory path")
 	electionDelay = flag.Duration("election_delay", 0, "Max random pause before participating in master election")
-	backend       = flag.String("backend", "", "GRPC endpoint to connect to Trillian logservers")
 
 	metricsEndpoint = flag.String("metrics_endpoint", "localhost:8099", "Endpoint for serving metrics")
 
 	maxIdleConnsPerHost = flag.Int("max_idle_conns_per_host", 10, "Max idle HTTP connections per host (0 = DefaultMaxIdleConnsPerHost)")
 	maxIdleConns        = flag.Int("max_idle_conns", 100, "Max number of idle HTTP connections across all hosts (0 = unlimited)")
-	tlsCACertFile       = flag.String("trillian_tls_ca_cert_file", "", "CA certificate file to use for secure connections with Trillian server")
+
+	// GCS Tessera flags
+	bundleSize    = flag.Int("bundle_size", 256, "Size of leaf bundle")
+	batchMaxSize  = flag.Int("batch_max_size", 1024, "Size of batch before flushing")
+	batchMaxAge   = flag.Duration("batch_max_age", 100*time.Millisecond, "Max age for batch entries before flushing")
+	pushBackLimit = flag.Uint64("pushback", 1000, "Number of inflight requests after which further additions will be refused")
+
+	project = flag.String("project", "", "GCP Project, take from env if unset")
+	bucket  = flag.String("bucket", "", "Bucket to use for storing log")
+	dbConn  = flag.String("db_conn", "", "CloudSQL DB URL")
+	dbUser  = flag.String("db_user", "", "")
+	dbPass  = flag.String("db_pass", "", "")
+	dbName  = flag.String("db_name", "", "")
+
+	signer   = flag.String("log_signer", "PRIVATE+KEY+Test-Betty+df84580a+Afge8kCzBXU7jb3cV2Q363oNXCufJ6u9mjOY1BGRY9E2", "Log signer")
+	verifier = flag.String("log_verifier", "Test-Betty+df84580a+AQQASqPUZoIHcJAF5mBOryctwFdTV1E0GRY4kEAtTzwB", "log verifier")
 )
+
+// Storage defines the explicit interface that storage implementations must implement for the HTTP handler here.
+// In addition, they'll need to implement the IntegrateStorage methods in log/writer/integrate.go too.
+type Storage interface {
+	// Sequence assigns the provided leaf data to an index in the log, returning
+	// that index once it's durably committed.
+	// Implementations are expected to integrate these new entries in a "timely" fashion.
+	Sequence(context.Context, []byte) (uint64, error)
+	AddSequenced(context.Context, uint64, [][]byte) error
+	NextAvailable(context.Context) (uint64, error)
+	SequenceForLeafHash(context.Context, []byte) (uint64, error)
+	CurrentTree(context.Context) (uint64, []byte, error)
+	NewTree(context.Context, uint64, []byte) error
+}
+
+func keysFromFlag() (note.Signer, note.Verifier) {
+	sKey, err := note.NewSigner(*signer)
+	if err != nil {
+		klog.Exitf("Invalid signing key: %v", err)
+	}
+	vKey, err := note.NewVerifier(*verifier)
+	if err != nil {
+		klog.Exitf("Invalid verifier key: %v", err)
+	}
+	return sKey, vKey
+}
 
 func main() {
 	klog.InitFlags(nil)
@@ -70,9 +106,6 @@ func main() {
 	klog.CopyStandardLogTo("WARNING")
 	defer klog.Flush()
 
-	if *backend == "" {
-		klog.Exit("--backend flag must be specified")
-	}
 	cfg, err := getConfig()
 	if err != nil {
 		klog.Exitf("Failed to load MigrillianConfig: %v", err)
@@ -81,31 +114,36 @@ func main() {
 		klog.Exitf("Failed to validate MigrillianConfig: %v", err)
 	}
 
-	klog.Infof("Dialling Trillian backend: %v", *backend)
-	creds, err := newTrillianTransportCredentialsFromFlags(*backend)
-	if err != nil {
-		klog.Exitf("Failed to get credentials: %v", err)
-	}
-	conn, err := grpc.Dial(*backend, grpc.WithTransportCredentials(creds), grpc.WithBlock())
-	if err != nil {
-		klog.Exitf("Could not dial Trillian server: %v: %v", *backend, err)
-	}
-
-	defer func() {
-		if err := conn.Close(); err != nil {
-			klog.Errorf("Could not close RPC connection: %v", err)
-		}
-	}()
-
 	httpClient := getHTTPClient()
 	mf := prometheus.MetricFactory{}
 	ef, closeFn := getElectionFactory()
 	defer closeFn()
 
 	ctx := context.Background()
+	opts := gcs.StorageOpts{
+		ProjectID:       *project,
+		Bucket:          *bucket,
+		EntryBundleSize: *bundleSize,
+		PushBackLimit:   *pushBackLimit,
+		DBConn:          *dbConn,
+		DBUser:          *dbUser,
+		DBPass:          *dbPass,
+		DBName:          *dbName,
+	}
+	sKey, vKey := keysFromFlag()
+	gcsStorage := gcs.New(ctx, opts, *batchMaxSize, *batchMaxAge, vKey, sKey)
+	var s Storage = gcsStorage
+
+	if _, _, err := s.CurrentTree(ctx); err != nil {
+		klog.Infof("ct: %v", err)
+		if err := s.NewTree(ctx, 0, []byte("Empty")); err != nil {
+			klog.Exitf("Failed to initialise log: %v", err)
+		}
+	}
+
 	var ctrls []*core.Controller
 	for _, mc := range cfg.MigrationConfigs.Config {
-		ctrl, err := getController(ctx, mc, httpClient, mf, ef, conn)
+		ctrl, err := getController(ctx, mc, httpClient, mf, ef, s)
 		if err != nil {
 			klog.Exitf("Failed to create Controller for %q: %v", mc.SourceUri, err)
 		}
@@ -123,33 +161,8 @@ func main() {
 	defer cancel()
 	go util.AwaitSignal(cctx, cancel)
 
+	go printStats(ctx, s.CurrentTree)
 	core.RunMigration(cctx, ctrls)
-}
-
-// newTrillianTransportCredentialsFromFlags returns "creds" of type credentials.TransportCredentials to be
-// passed as credentials arguments to grpc.WithTransportCredentials. It configures TLS credentials
-// if a CA certificate file is specified, otherwise it uses insecure credentials.
-func newTrillianTransportCredentialsFromFlags(backend string) (credentials.TransportCredentials, error) {
-	var creds credentials.TransportCredentials
-
-	if len(*tlsCACertFile) > 0 {
-		tlsCaCert, err := os.ReadFile(filepath.Clean(*tlsCACertFile))
-		if err != nil {
-			return nil, err
-		}
-		certPool := x509.NewCertPool()
-		if !certPool.AppendCertsFromPEM(tlsCaCert) {
-			return nil, fmt.Errorf("failed to append CA certificate to pool")
-		}
-		creds = credentials.NewTLS(&tls.Config{
-			ServerName: backend,
-			RootCAs:    certPool,
-			MinVersion: tls.VersionTLS12,
-		})
-	} else {
-		creds = insecure.NewCredentials()
-	}
-	return creds, nil
 }
 
 // getController creates a single log migration Controller.
@@ -159,21 +172,21 @@ func getController(
 	httpClient *http.Client,
 	mf monitoring.MetricFactory,
 	ef election2.Factory,
-	conn *grpc.ClientConn,
+	s Storage,
 ) (*core.Controller, error) {
 	ctOpts := jsonclient.Options{PublicKeyDER: cfg.PublicKey.Der, UserAgent: "ct-go-migrillian/1.0"}
 	ctClient, err := client.New(cfg.SourceUri, httpClient, ctOpts)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create CT client: %v", err)
 	}
-	plClient, err := newPreorderedLogClient(ctx, conn, cfg)
+	destLogClient, err := newGCSTesseraLogClient(cfg, s)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create PreorderedLogClient: %v", err)
+		return nil, fmt.Errorf("failed to create GCSTesseraLogClient: %v", err)
 	}
 
 	opts := core.OptionsFromConfig(cfg)
 	opts.StartDelay = *electionDelay
-	return core.NewController(opts, ctClient, plClient, ef, mf), nil
+	return core.NewController(opts, ctClient, destLogClient, ef, mf), nil
 }
 
 // getConfig returns MigrillianConfig loaded from the file specified in flags.
@@ -206,21 +219,11 @@ func getHTTPClient() *http.Client {
 	}
 }
 
-// newPreorderedLogClient creates a PreorderedLogClient for the specified tree.
-func newPreorderedLogClient(
-	ctx context.Context,
-	conn *grpc.ClientConn,
+// newGCSTesseraLogClient creates a PreorderedLogClient for the specified tree.
+func newGCSTesseraLogClient(
 	cfg *configpb.MigrationConfig,
-) (*core.PreorderedLogClient, error) {
-	admin := trillian.NewTrillianAdminClient(conn)
-	gt := trillian.GetTreeRequest{TreeId: cfg.LogId}
-	tree, err := admin.GetTree(ctx, &gt)
-	if err != nil {
-		return nil, err
-	}
-	log := trillian.NewTrillianLogClient(conn)
-	pref := fmt.Sprintf("%d", cfg.LogId)
-	return core.NewPreorderedLogClient(log, tree, cfg.IdentityFunction, pref)
+	s Storage) (*core.GCSTesseraClient, error) {
+	return core.NewGCSTesseraClient(cfg.LogId, cfg.IdentityFunction, s)
 }
 
 // getElectionFactory returns an election factory based on flags, and a
@@ -252,4 +255,26 @@ func getElectionFactory() (election2.Factory, func()) {
 	factory := etcdelect.NewFactory(instanceID, cli, *lockDir)
 
 	return factory, closeFn
+}
+
+func printStats(ctx context.Context, s func(ctx context.Context) (uint64, []byte, error)) {
+	interval := time.Second
+	var lastSize uint64
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(interval):
+			size, _, err := s(ctx)
+			if err != nil {
+				klog.Errorf("Failed to get checkpoint: %v", err)
+				continue
+			}
+			if lastSize > 0 {
+				added := size - lastSize
+				klog.Infof("CP size %d (+%d)", size, added)
+			}
+			lastSize = size
+		}
+	}
 }

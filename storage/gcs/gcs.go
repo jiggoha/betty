@@ -857,5 +857,11 @@ func (s *Storage) NewTree(ctx context.Context, size uint64, hash []byte) error {
 	if err != nil {
 		return err
 	}
+
+	// TODO: doIntegrate calls this to write a new checkpoint, do this more cleanly
+	_, _, err = s.readCheckpoint(ctx)
+	if err != nil {
+		return err
+	}
 	return s.writeCheckpoint(ctx, n)
 }

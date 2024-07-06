@@ -107,11 +107,11 @@ func OptionsFromConfig(cfg *configpb.MigrationConfig) Options {
 
 // Controller coordinates migration from a CT log to a Trillian tree.
 type Controller struct {
-	opts     Options
-	ctClient *client.LogClient
-	plClient *PreorderedLogClient
-	ef       election2.Factory
-	label    string
+	opts          Options
+	ctClient      *client.LogClient
+	destLogClient *GCSTesseraClient
+	ef            election2.Factory
+	label         string
 }
 
 // NewController creates a Controller configured by the passed in options, CT
@@ -122,20 +122,20 @@ type Controller struct {
 func NewController(
 	opts Options,
 	ctClient *client.LogClient,
-	plClient *PreorderedLogClient,
+	destLogClient *GCSTesseraClient,
 	ef election2.Factory,
 	mf monitoring.MetricFactory,
 ) *Controller {
 	initMetrics(mf)
-	l := strconv.FormatInt(plClient.treeID, 10)
-	return &Controller{opts: opts, ctClient: ctClient, plClient: plClient, ef: ef, label: l}
+	l := strconv.FormatInt(destLogClient.treeID, 10)
+	return &Controller{opts: opts, ctClient: ctClient, destLogClient: destLogClient, ef: ef, label: l}
 }
 
 // RunWhenMasterWithRestarts calls RunWhenMaster, and, if the migration is
 // configured with continuous mode, restarts it whenever it returns.
 func (c *Controller) RunWhenMasterWithRestarts(ctx context.Context) {
 	uri := c.ctClient.BaseURI()
-	treeID := c.plClient.treeID
+	treeID := c.destLogClient.treeID
 	for run := true; run; run = c.opts.Continuous && ctx.Err() == nil {
 		klog.Infof("Starting migration Controller (%d<-%q)", treeID, uri)
 		if err := c.RunWhenMaster(ctx); err != nil {
@@ -263,19 +263,19 @@ func (c *Controller) Run(ctx context.Context) error {
 // with respect to the passed in minimal position to start from, and the
 // current tree size obtained from an STH.
 func (c *Controller) fetchTail(ctx context.Context, begin uint64) (uint64, error) {
-	treeSize, rootHash, err := c.plClient.getRoot(ctx)
+	nextSeq, err := c.destLogClient.storage.NextAvailable(ctx)
 	if err != nil {
 		return 0, err
 	}
 
 	fo := c.opts.FetcherOptions
 	if fo.Continuous { // Ignore range parameters in continuous mode.
-		fo.StartIndex, fo.EndIndex = int64(treeSize), 0
+		fo.StartIndex, fo.EndIndex = int64(nextSeq), 0
 		// Use non-continuous Fetcher, as we implement continuity in Controller.
 		// TODO(pavelkalinnikov): Don't overload Fetcher's Continuous flag.
 		fo.Continuous = false
 	} else if fo.StartIndex < 0 {
-		fo.StartIndex = int64(treeSize)
+		fo.StartIndex = int64(nextSeq)
 	}
 	if int64(begin) > fo.StartIndex {
 		fo.StartIndex = int64(begin)
@@ -293,9 +293,10 @@ func (c *Controller) fetchTail(ctx context.Context, begin uint64) (uint64, error
 		return begin, nil
 	}
 
-	if err := c.verifyConsistency(ctx, treeSize, rootHash, sth); err != nil {
-		return 0, err
-	}
+	// TODO: do we still want to verify consistency?
+	// if err := c.verifyConsistency(ctx, treeSize, rootHash, sth); err != nil {
+	// 	return 0, err
+	// }
 
 	var wg sync.WaitGroup
 	batches := make(chan scanner.EntryBatch, c.opts.ChannelSize)
@@ -363,13 +364,13 @@ func (c *Controller) runSubmitter(ctx context.Context, batches <-chan scanner.En
 		metrics.entriesSeen.Add(entries, c.label)
 
 		end := b.Start + int64(len(b.Entries))
-		if err := c.plClient.addSequencedLeaves(ctx, &b); err != nil {
+		if err := c.destLogClient.addSequencedLeaves(ctx, &b); err != nil {
 			// addSequencedLeaves failed to submit entries despite retries. At this
 			// point there is not much we can do. Seemingly the best strategy is to
 			// shut down the Controller.
 			return fmt.Errorf("failed to add batch [%d, %d): %v", b.Start, end, err)
 		}
-		klog.Infof("%s: added batch [%d, %d)", c.label, b.Start, end)
+		klog.Infof("Tree %s: added batch [%d, %d)", c.label, b.Start, end)
 		metrics.entriesStored.Add(entries, c.label)
 	}
 	return nil
