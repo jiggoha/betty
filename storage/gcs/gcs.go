@@ -711,8 +711,8 @@ func (s *Storage) doIntegrate(ctx context.Context, from uint64, batch [][]byte) 
 		klog.Errorf("Failed to integrate: %v", err)
 		return err
 	}
-	if err := s.NewTree(ctx, newSize, newRoot); err != nil {
-		return fmt.Errorf("newTree: %v", err)
+	if err := s.updateCheckpoint(ctx, newSize, newRoot); err != nil {
+		return fmt.Errorf("updateCheckpoint: %v", err)
 	}
 	return nil
 }
@@ -847,6 +847,24 @@ func (s *Storage) currentTreeGen(ctx context.Context) (uint64, []byte, int64, er
 	return cp.Size, cp.Hash, cpGen, nil
 }
 
+func (s *Storage) updateCheckpoint(ctx context.Context, size uint64, hash []byte) error {
+	cp := &f_log.Checkpoint{
+		Origin: s.cpS.Name(),
+		Size:   size,
+		Hash:   hash,
+	}
+	n, err := note.Sign(&note.Note{Text: string(cp.Marshal())}, s.cpS)
+	if err != nil {
+		return err
+	}
+
+	_, _, err = s.readCheckpoint(ctx)
+	if err != nil {
+		return err
+	}
+	return s.writeCheckpoint(ctx, n)
+}
+
 func (s *Storage) NewTree(ctx context.Context, size uint64, hash []byte) error {
 	cp := &f_log.Checkpoint{
 		Origin: s.cpS.Name(),
@@ -858,10 +876,5 @@ func (s *Storage) NewTree(ctx context.Context, size uint64, hash []byte) error {
 		return err
 	}
 
-	// TODO: doIntegrate calls this to write a new checkpoint, do this more cleanly
-	_, _, err = s.readCheckpoint(ctx)
-	if err != nil {
-		return err
-	}
 	return s.writeCheckpoint(ctx, n)
 }
