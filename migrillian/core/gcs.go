@@ -47,7 +47,7 @@ type Storage interface {
 	// that index once it's durably committed.
 	// Implementations are expected to integrate these new entries in a "timely" fashion.
 	Sequence(context.Context, []byte) (uint64, error)
-	AddSequenced(context.Context, uint64, [][]byte) error
+	AddSequenced(context.Context, uint64, []byte) error
 	NextAvailable(context.Context) (uint64, error)
 	SequenceForLeafHash(context.Context, []byte) (uint64, error)
 	CurrentTree(context.Context) (uint64, []byte, error)
@@ -99,7 +99,14 @@ func ctBatchToTesseraBatch(b *scanner.EntryBatch) (startIndex uint64, data [][]b
 // addSequencedLeaves adds a collection CT log entries into GCS Tessera log.
 func (c *GCSTesseraClient) addSequencedLeaves(ctx context.Context, b *scanner.EntryBatch) error {
 	startIndex, data := ctBatchToTesseraBatch(b)
-	return c.storage.AddSequenced(ctx, startIndex, data)
+
+	for i, entry := range data {
+		if err := c.storage.AddSequenced(ctx, startIndex+uint64(i), entry); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 // getNextAvailable returns the next unassigned sequence number.
@@ -108,7 +115,7 @@ func (c *GCSTesseraClient) getNextAvailable(ctx context.Context) (uint64, error)
 	// TODO: make this cleaner.
 	_, _, err := c.storage.CurrentTree(ctx)
 	if err != nil {
-		fmt.Errorf("failed read CurrentTree: %v", err)
+		return 0, fmt.Errorf("failed read CurrentTree: %v", err)
 	}
 
 	return c.storage.NextAvailable(ctx)

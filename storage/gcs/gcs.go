@@ -87,7 +87,8 @@ type Storage struct {
 	// read. This is useful for read-modify-write operation of the checkpoint.
 	checkpointGen int64
 
-	pool *writer.Pool
+	pool           *writer.Pool
+	preorderedPool *writer.PreorderedPool
 
 	checkpointCacheControl string
 	otherCacheControl      string
@@ -184,6 +185,89 @@ func New(ctx context.Context, opts StorageOpts, batchMaxSize int, batchMaxAge ti
 	}
 
 	r.pool = writer.NewPool(batchMaxSize, batchMaxAge, r.sequenceBatch)
+	go func() {
+		t := time.NewTicker(5 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				for {
+					cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+					defer cancel()
+					if more, err := r.assignSequenceAndIntegrate(cctx); err != nil {
+						klog.Errorf("assignSequenceAndIntegrate: %v", err)
+						break
+					} else if !more {
+						break
+					}
+					klog.Info("Quickloop")
+				}
+			}
+		}
+	}()
+
+	return r
+}
+
+// NewPreordered returns a Client which allows interaction with the log stored in
+// the specified bucket on GCS.
+func NewPreordered(ctx context.Context, opts StorageOpts, batchMaxSize int, batchMaxAge time.Duration, cpV note.Verifier, cpS note.Signer) *Storage {
+	c, err := gcs.NewClient(ctx)
+	if err != nil {
+		klog.Exitf("Failed to create GCS storage: %v", err)
+	}
+
+	d, err := cloudsqlconn.NewDialer(context.Background())
+	if err != nil {
+		klog.Exitf("cloudsqlconn.NewDialer: %v", err)
+	}
+	mysql.RegisterDialContext("cloudsqlconn",
+		func(ctx context.Context, addr string) (net.Conn, error) {
+			return d.Dial(ctx, opts.DBConn)
+		})
+
+	dbURI := fmt.Sprintf("%s:%s@cloudsqlconn(localhost:3306)/%s?parseTime=true",
+		opts.DBUser, opts.DBPass, opts.DBName)
+
+	dbPool, err := sql.Open("mysql", dbURI)
+	if err != nil {
+		klog.Exitf("Failed to open CloudSQL: %v", err)
+	}
+
+	if err := initDB(ctx, dbPool); err != nil {
+		klog.Exitf("Failed to init DB: %v", err)
+	}
+
+	r := &Storage{
+		gcsClient: c,
+		projectID: opts.ProjectID,
+		bucket:    opts.Bucket,
+		dbPool:    dbPool,
+
+		checkpointGen:          0,
+		checkpointCacheControl: opts.CheckpointCacheControl,
+		otherCacheControl:      opts.OtherCacheControl,
+		entryBundleSize:        opts.EntryBundleSize,
+		batchMaxSize:           batchMaxSize,
+		pushBackLimit:          opts.PushBackLimit,
+		cpV:                    cpV,
+		cpS:                    cpS,
+	}
+	if e, err := r.bucketExists(ctx, opts.Bucket); err != nil {
+		klog.Exitf("Failed to check whether bucket %q exists: %v", opts.Bucket, err)
+	} else if !e {
+		if err := r.create(ctx, opts.Bucket); err != nil {
+			klog.Exitf("Failed to create bucket %q: %v", opts.Bucket, err)
+		}
+	}
+
+	next, err := r.NextAvailable(ctx)
+	if err != nil {
+		klog.Exitf("Failed to get NextAvailable from storage: %v", err)
+	}
+	r.preorderedPool = writer.NewPreorderedPool(batchMaxSize, batchMaxAge, next, r.writeSequencedBatch)
 	go func() {
 		t := time.NewTicker(5 * time.Second)
 		defer t.Stop()
@@ -418,11 +502,13 @@ func (s *Storage) NextAvailable(ctx context.Context) (uint64, error) {
 }
 
 // AddSequenced commits leaves to the log starting at the index of startSeq.
-func (s *Storage) AddSequenced(ctx context.Context, startSeq uint64, leaves [][]byte) error {
-	batch := writer.Batch{
-		Entries: leaves,
-	}
+func (s *Storage) AddSequenced(ctx context.Context, idx uint64, leaf []byte) error {
+	return s.preorderedPool.Set(idx, leaf)
+}
 
+// TODO: function documentation.
+// writes the SequenceBatch (data, startIdx) into the log.
+func (s *Storage) writeSequencedBatch(ctx context.Context, batch writer.SequencedBatch) error {
 	b := &bytes.Buffer{}
 	e := gob.NewEncoder(b)
 	if err := e.Encode(batch); err != nil {
@@ -441,22 +527,26 @@ func (s *Storage) AddSequenced(ctx context.Context, startSeq uint64, leaves [][]
 		}
 	}()
 
-	// Check that the start index of the leaves provided is consistent with the
-	// next unassigned sequence number.
 	r := tx.QueryRowContext(ctx, "SELECT id, next FROM SeqCoord WHERE id = ? FOR UPDATE", 0)
 	var id, next uint64
 	if err := r.Scan(&id, &next); err != nil {
 		return fmt.Errorf("failed to read seqcoord: %v", err)
 	}
-	if next != startSeq {
-		return fmt.Errorf("startSeq of AddSequenced call should match SeqCoord: got %d, want %d", startSeq, next)
+
+	if next != batch.BatchStartIdx {
+		return fmt.Errorf("integrity fail - expected seq %d, but started at %d", next, batch.BatchStartIdx)
 	}
 
-	// Add presequenced entries to Seq and update SeqCoord with the number of presequenced entries.
-	if _, err := tx.ExecContext(ctx, "INSERT INTO Seq(id, seq, v) VALUES(?, ?, ?)", 0, startSeq, data); err != nil {
+	// TODO: how should Migrillian handle this?
+	if next-s.curSize > s.pushBackLimit {
+		klog.Infof("Pushback: %d-%d > %d", next, s.curSize, s.pushBackLimit)
+		return ErrPushback
+	}
+
+	if _, err := tx.ExecContext(ctx, "INSERT INTO Seq(id, seq, v) VALUES(?, ?, ?)", 0, next, data); err != nil {
 		return fmt.Errorf("insert into seq: %v", err)
 	}
-	if _, err := tx.ExecContext(ctx, "UPDATE SeqCoord SET next = ? WHERE ID = ?", startSeq+uint64(num), 0); err != nil {
+	if _, err := tx.ExecContext(ctx, "UPDATE SeqCoord SET next = ? WHERE ID = ?", next+uint64(num), 0); err != nil {
 		return fmt.Errorf("update seqcoord: %v", err)
 	}
 
@@ -464,7 +554,6 @@ func (s *Storage) AddSequenced(ctx context.Context, startSeq uint64, leaves [][]
 		return fmt.Errorf("commit: %v", err)
 	}
 	tx = nil
-
 	return nil
 }
 
@@ -569,7 +658,7 @@ func (s *Storage) assignSequenceAndIntegrate(ctx context.Context) (bool, error) 
 		klog.Infof("SA: Sequencing & integrate: did %d @ %.1f qps took %0.1fs [r:%vs s:%vs i:%vs q:%vs]", numAdded, qps, d, f(now, readDone), f(readDone, sequenceDone), f(sequenceDone, integrateDone), f(integrateDone, sqlDone))
 	}()
 
-	rows, err := tx.QueryContext(ctx, "SELECT seq, v FROM Seq WHERE id = ? AND seq >= ? ORDER BY SEQ LIMIT 10 FOR UPDATE", 0, fromSeq)
+	rows, err := tx.QueryContext(ctx, "SELECT seq, v FROM Seq WHERE id = ? AND seq >= ? ORDER BY SEQ LIMIT ? FOR UPDATE", 0, fromSeq, s.batchMaxSize)
 	if err != nil {
 		return false, fmt.Errorf("failed to read Seq: %v", err)
 	}

@@ -59,7 +59,7 @@ var (
 
 	// GCS Tessera flags
 	bundleSize    = flag.Int("bundle_size", 256, "Size of leaf bundle")
-	batchMaxSize  = flag.Int("batch_max_size", 1024, "Size of batch before flushing")
+	batchMaxSize  = flag.Int("batch_max_size", 256, "Size of batch before flushing")
 	batchMaxAge   = flag.Duration("batch_max_age", 100*time.Millisecond, "Max age for batch entries before flushing")
 	pushBackLimit = flag.Uint64("pushback", 1000, "Number of inflight requests after which further additions will be refused")
 
@@ -81,7 +81,7 @@ type Storage interface {
 	// that index once it's durably committed.
 	// Implementations are expected to integrate these new entries in a "timely" fashion.
 	Sequence(context.Context, []byte) (uint64, error)
-	AddSequenced(context.Context, uint64, [][]byte) error
+	AddSequenced(context.Context, uint64, []byte) error
 	NextAvailable(context.Context) (uint64, error)
 	SequenceForLeafHash(context.Context, []byte) (uint64, error)
 	CurrentTree(context.Context) (uint64, []byte, error)
@@ -131,7 +131,7 @@ func main() {
 		DBName:          *dbName,
 	}
 	sKey, vKey := keysFromFlag()
-	gcsStorage := gcs.New(ctx, opts, *batchMaxSize, *batchMaxAge, vKey, sKey)
+	gcsStorage := gcs.NewPreordered(ctx, opts, *batchMaxSize, *batchMaxAge, vKey, sKey)
 	var s Storage = gcsStorage
 
 	if _, _, err := s.CurrentTree(ctx); err != nil {
